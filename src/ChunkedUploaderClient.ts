@@ -5,7 +5,6 @@ interface Endpoints {
 }
 
 interface ChunkedUploaderClientProps {
-  chunkSize: number;
   endpoints: Endpoints;
   headers?: HeadersInit;
 }
@@ -17,7 +16,7 @@ export class ChunkedUploaderClient {
     this.config = config;
   }
 
-  async upload(file: File) {
+  async upload(file: File, chunkSize: number) {
     let { init, upload, finish } = this.config.endpoints;
 
     const initResponse = await fetch(init, {
@@ -45,12 +44,12 @@ export class ChunkedUploaderClient {
     upload = upload.replace("{uploadId}", uploadId);
     finish = finish.replace("{uploadId}", uploadId);
 
-    const chunks = Math.ceil(file.size / this.config.chunkSize);
+    const chunks = Math.ceil(file.size / chunkSize);
     const promises: Promise<Response>[] = [];
 
     for (let i = 0; i < chunks; i++) {
-      const start = i * this.config.chunkSize;
-      const end = Math.min(file.size, start + this.config.chunkSize);
+      const start = i * chunkSize;
+      const end = Math.min(file.size, start + chunkSize);
       const chunk = file.slice(start, end);
       const formData = new FormData();
       formData.append("file", chunk);
