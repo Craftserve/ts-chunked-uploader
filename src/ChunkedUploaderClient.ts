@@ -4,16 +4,16 @@ interface Endpoints {
   finish: string;
 }
 
-interface FileUploaderConfig {
+interface ChunkedUploaderClientProps {
   chunkSize: number;
   endpoints: Endpoints;
   headers?: HeadersInit;
 }
 
-class FileUploader {
-  private config: FileUploaderConfig;
+export class ChunkedUploaderClient {
+  private config: ChunkedUploaderClientProps;
 
-  constructor(config: FileUploaderConfig) {
+  constructor(config: ChunkedUploaderClientProps) {
     this.config = config;
   }
 
