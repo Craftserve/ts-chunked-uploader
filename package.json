@@ -1,0 +1,25 @@
+{
+  "name": "ts-chunked-uploader",
+  "version": "1.0.0",
+  "description": "TS client for chunked-uplaoder",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "craftserve",
+    "chunked-uploader"
+  ],
+  "author": "Craftserve",
+  "license": "ISC",
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  },
+  "homepage": "https://github.com/Craftserve/ts-chunked-uploaderfs#readme",
+  "files": [
+    "/dist"
+  ]
+}
