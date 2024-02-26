@@ -32,7 +32,7 @@ export class ChunkedUploaderClient {
     let uploadId;
     try {
       const data = await initResponse.json();
-      uploadId = data.uploadId;
+      uploadId = data.upload_id;
     } catch (error) {
       throw new Error("Failed to parse uploadId");
     }
