@@ -55,13 +55,21 @@ export class ChunkedUploaderClient {
       formData.append("file", chunk);
 
       promises.push(
-        fetch(upload, {
-          method: "POST",
-          headers: {
-            ...this.config.headers,
-            Range: `bytes=${start}-${end}`,
-          },
-          body: formData,
+        new Promise((resolve, reject) => {
+          fetch(upload, {
+            method: "POST",
+            headers: {
+              ...this.config.headers,
+              Range: `bytes=${start}-${end}`,
+            },
+            body: formData,
+          })
+            .then((res) => {
+              resolve(res);
+            })
+            .catch((err) => {
+              reject(err);
+            });
         })
       );
     }
@@ -93,22 +101,26 @@ export class ChunkedUploaderClient {
 
     let path = "";
 
-    Promise.all(promises).then(async () => {
-      const response = await fetch(finish, {
-        method: "POST",
-        headers: this.config.headers,
-        body: JSON.stringify({ checksum: sha256 }),
+    Promise.all(promises)
+      .then(async () => {
+        const response = await fetch(finish, {
+          method: "POST",
+          headers: this.config.headers,
+          body: JSON.stringify({ checksum: sha256 }),
+        });
+
+        if (response.status !== 200) {
+          throw new Error("Failed to finish upload. Checksum mismatch.");
+        }
+
+        const data = await response.json();
+        if (data.path) {
+          path = data.path;
+        }
+      })
+      .catch((err) => {
+        throw new Error("Failed to upload file: " + err);
       });
-
-      if (response.status !== 200) {
-        throw new Error("Failed to finish upload. Checksum mismatch.");
-      }
-
-      const data = await response.json();
-      if (data.path) {
-        path = data.path;
-      }
-    });
 
     return path;
   }
