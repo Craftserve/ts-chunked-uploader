@@ -68,6 +68,7 @@ export class ChunkedUploaderClient {
               resolve(res);
             })
             .catch((err) => {
+              console.error(err);
               reject(err);
             });
         })
@@ -88,6 +89,7 @@ export class ChunkedUploaderClient {
             resolve(hashHex);
           })
           .catch((err) => {
+            console.error(err);
             throw new Error("Failed to calculate checksum");
           });
       };
@@ -119,6 +121,7 @@ export class ChunkedUploaderClient {
         }
       })
       .catch((err) => {
+        console.error(err);
         throw new Error("Failed to upload file: " + err);
       });
 
