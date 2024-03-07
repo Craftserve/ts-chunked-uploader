@@ -16,7 +16,7 @@ export class ChunkedUploaderClient {
     this.config = config;
   }
 
-  async upload(file: File, chunkSize: number) {
+  async upload(file: File, chunkSize: number): Promise<string> {
     let { init, upload, finish } = this.config.endpoints;
 
     const initResponse = await fetch(init, {
@@ -91,6 +91,8 @@ export class ChunkedUploaderClient {
       reader.readAsArrayBuffer(file);
     });
 
+    let path = "";
+
     Promise.all(promises).then(async () => {
       const response = await fetch(finish, {
         method: "POST",
@@ -101,8 +103,13 @@ export class ChunkedUploaderClient {
       if (response.status !== 200) {
         throw new Error("Failed to finish upload. Checksum mismatch.");
       }
+
+      const data = await response.json();
+      if (data.path) {
+        path = data.path;
+      }
     });
 
-    return uploadId;
+    return path;
   }
 }
