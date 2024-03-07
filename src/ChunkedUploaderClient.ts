@@ -29,20 +29,20 @@ export class ChunkedUploaderClient {
       throw new Error("Failed to initialize upload");
     }
 
-    let uploadId;
+    let upload_id;
     try {
       const data = await initResponse.json();
-      uploadId = data.upload_id;
+      upload_id = data.upload_id;
     } catch (error) {
-      throw new Error("Failed to parse uploadId");
+      throw new Error("Failed to parse upload_id");
     }
 
-    if (!upload.includes("{uploadId}") || !finish.includes("{uploadId}")) {
+    if (!upload.includes("{upload_id}") || !finish.includes("{upload_id}")) {
       throw new Error("Invalid endpoint configuration");
     }
 
-    upload = upload.replace("{uploadId}", uploadId);
-    finish = finish.replace("{uploadId}", uploadId);
+    upload = upload.replace("{upload_id}", upload_id);
+    finish = finish.replace("{upload_id}", upload_id);
 
     const chunks = Math.ceil(file.size / chunkSize);
     const promises: Promise<Response>[] = [];
