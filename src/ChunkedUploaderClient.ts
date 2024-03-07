@@ -103,7 +103,7 @@ export class ChunkedUploaderClient {
 
     let path = "";
 
-    Promise.all(promises)
+    await Promise.all(promises)
       .then(async () => {
         const response = await fetch(finish, {
           method: "POST",
