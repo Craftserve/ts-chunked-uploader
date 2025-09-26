@@ -24,7 +24,7 @@ export enum UploadState {
     Done = "done",
 }
 
-interface ProgressState {
+export interface ProgressState {
     uploaded: number;
     total: number;
     state: UploadState;
