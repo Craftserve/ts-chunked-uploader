@@ -164,6 +164,7 @@ export class UploaderClient {
                         uploaded,
                         total,
                         state: UploadState.Uploading,
+                        currentChunkSize: chunkLength,
                     });
                 })
                 .catch((err) => {

@@ -28,4 +28,5 @@ export interface ProgressState {
     uploaded: number;
     total: number;
     state: UploadState;
+    currentChunkSize?: number;
 }
