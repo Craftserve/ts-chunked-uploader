@@ -11,7 +11,6 @@ export interface RequestInitOptions {
 
 export interface ChunkedUploaderClientProps {
     endpoints: Endpoints;
-    path: string;
     onFinalize?: Promise<unknown>;
     headers?: HeadersInit;
     initOptions?: RequestInitOptions;
