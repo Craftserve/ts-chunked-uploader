@@ -118,6 +118,9 @@ export class UploaderClient {
 
         const upload_id = sha256;
 
+        upload = upload.replace("{upload_id}", upload_id);
+        finish = finish.replace("{upload_id}", upload_id);
+
         this.reportProgress({
             uploaded: 0,
             total,
