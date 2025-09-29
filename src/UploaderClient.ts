@@ -246,7 +246,7 @@ export class UploaderClient {
             }
 
             if (this.config.onFinalize) {
-                await this.config.onFinalize;
+                await this.config.onFinalize(upload_id);
             }
 
             this.reportProgress({
