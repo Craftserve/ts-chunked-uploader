@@ -1,21 +1,10 @@
-import { ProgressState, RequestInitOptions, UploadState } from "./types";
+import {
+    ChunkedUploaderClientProps,
+    ProgressState,
+    UploadState,
+} from "./types";
 
-export interface LegacyEndpoints {
-    init: string;
-    upload: string;
-    finish: string;
-}
-
-interface ChunkedUploaderClientProps {
-    endpoints: LegacyEndpoints;
-    headers?: HeadersInit;
-    initOptions?: RequestInitOptions;
-}
-
-/**
- * @deprecated ChunkUploaderClient is deprecated and will be removed in future releases. Please use UploaderClient instead.
- */
-export class ChunkedUploaderClient {
+export class UploaderClient {
     private config: ChunkedUploaderClientProps;
     private abortController?: AbortController;
     private aborted = false;
@@ -68,7 +57,7 @@ export class ChunkedUploaderClient {
         this.aborted = false;
         this.abortController = new AbortController();
 
-        let { init, upload, finish } = this.config.endpoints;
+        let { upload, finish } = this.config.endpoints;
         this.abortController = new AbortController();
 
         const total = file.size;
@@ -79,113 +68,6 @@ export class ChunkedUploaderClient {
             total,
             state: UploadState.Initializing,
         });
-
-        let initResponse: Response;
-        try {
-            initResponse = await fetch(init, {
-                method: "POST",
-                headers: this.config.headers,
-                body: JSON.stringify({
-                    file_size: file.size,
-                    ...this.config.initOptions?.body,
-                }),
-                signal: this.abortController.signal,
-            });
-        } catch (err) {
-            this.reportProgress({ uploaded, total, state: UploadState.Error });
-            throw new Error("Failed to initialize upload: " + err);
-        }
-
-        if (initResponse.status !== 201) {
-            this.reportProgress({ uploaded, total, state: UploadState.Error });
-            throw new Error("Failed to initialize upload");
-        }
-
-        let upload_id: string;
-        try {
-            const data = await initResponse.json();
-            upload_id = data.upload_id;
-        } catch (error) {
-            this.reportProgress({ uploaded, total, state: UploadState.Error });
-            throw new Error("Failed to parse upload_id");
-        }
-
-        this.reportProgress({
-            uploaded: 0,
-            total,
-            state: UploadState.Uploading,
-        });
-
-        if (
-            !upload.includes("{upload_id}") ||
-            !finish.includes("{upload_id}")
-        ) {
-            this.reportProgress({ uploaded, total, state: UploadState.Error });
-            throw new Error("Invalid endpoint configuration");
-        }
-
-        upload = upload.replace("{upload_id}", upload_id);
-        finish = finish.replace("{upload_id}", upload_id);
-
-        const chunks = Math.ceil(file.size / chunkSize);
-        const promises: Promise<void>[] = [];
-
-        for (let i = 0; i < chunks; i++) {
-            if (this.aborted) break;
-
-            const start = i * chunkSize;
-            const end = Math.min(file.size, start + chunkSize);
-            const chunk = file.slice(start, end);
-            const chunkLength = end - start;
-
-            const formData = new FormData();
-            formData.append("file", chunk);
-
-            const p = fetch(upload, {
-                method: "POST",
-                headers: {
-                    ...this.config.headers,
-
-                    Range: `bytes=${start}-${end}`,
-                },
-                body: formData,
-                signal: this.abortController.signal,
-            })
-                .then((res) => {
-                    if (!res.ok) {
-                        throw new Error(
-                            `Chunk upload failed with status ${res.status}`
-                        );
-                    }
-
-                    uploaded += chunkLength;
-
-                    if (uploaded > total) uploaded = total;
-                    this.reportProgress({
-                        uploaded,
-                        total,
-                        state: UploadState.Uploading,
-                    });
-                })
-                .catch((err) => {
-                    if (this.aborted) {
-                        this.reportProgress({
-                            uploaded,
-                            total,
-                            state: UploadState.Error,
-                        });
-                        throw new Error("Upload aborted");
-                    }
-                    this.reportProgress({
-                        uploaded,
-                        total,
-                        state: UploadState.Error,
-                    });
-                    throw err;
-                });
-
-            promises.push(p);
-        }
 
         const sha256: string = await new Promise((resolve, reject) => {
             const reader = new FileReader();
@@ -234,12 +116,79 @@ export class ChunkedUploaderClient {
             }
         });
 
+        const upload_id = sha256;
+
+        this.reportProgress({
+            uploaded: 0,
+            total,
+            state: UploadState.Uploading,
+        });
+
+        const chunks = Math.ceil(file.size / chunkSize);
+        const promises: Promise<void>[] = [];
+
+        for (let i = 0; i < chunks; i++) {
+            if (this.aborted) break;
+
+            const start = i * chunkSize;
+            const end = Math.min(file.size, start + chunkSize);
+            const chunk = file.slice(start, end);
+            const chunkLength = end - start;
+
+            const formData = new FormData();
+            formData.append("file", chunk);
+
+            const p = fetch(upload, {
+                method: "APPEND",
+                headers: {
+                    ...this.config.headers,
+                    Range: `offset=${start}-${end}`,
+                },
+                body: formData,
+                signal: this.abortController.signal,
+            })
+                .then((res) => {
+                    if (!res.ok) {
+                        throw new Error(
+                            `Chunk upload failed with status ${res.status}`
+                        );
+                    }
+
+                    uploaded += chunkLength;
+
+                    if (uploaded > total) uploaded = total;
+                    this.reportProgress({
+                        uploaded,
+                        total,
+                        state: UploadState.Uploading,
+                    });
+                })
+                .catch((err) => {
+                    if (this.aborted) {
+                        this.reportProgress({
+                            uploaded,
+                            total,
+                            state: UploadState.Error,
+                        });
+                        throw new Error("Upload aborted");
+                    }
+                    this.reportProgress({
+                        uploaded,
+                        total,
+                        state: UploadState.Error,
+                    });
+                    throw err;
+                });
+
+            promises.push(p);
+        }
+
         if (this.aborted) {
             this.reportProgress({ uploaded, total, state: UploadState.Error });
             throw new Error("Upload aborted during checksum calculation");
         }
 
-        let path = "";
+        let hash = "";
 
         try {
             await Promise.all(promises);
@@ -261,9 +210,8 @@ export class ChunkedUploaderClient {
             });
 
             const response = await fetch(finish, {
-                method: "POST",
+                method: "GET",
                 headers: this.config.headers,
-                body: JSON.stringify({ checksum: sha256 }),
                 signal: this.abortController.signal,
             });
 
@@ -279,7 +227,24 @@ export class ChunkedUploaderClient {
             }
 
             const data = await response.json();
-            if (data.path) path = data.path;
+
+            if (!data.hash || !data.length) {
+                throw new Error("No hash returned from server");
+            }
+
+            hash = data.hash;
+
+            if (hash !== sha256) {
+                throw new Error("Checksum mismatch after upload");
+            }
+
+            if (data.length !== total) {
+                throw new Error("Uploaded length mismatch after upload");
+            }
+
+            if (this.config.onFinalize) {
+                await this.config.onFinalize;
+            }
 
             this.reportProgress({
                 uploaded: total,
@@ -291,6 +256,6 @@ export class ChunkedUploaderClient {
             throw new Error("Failed to upload file: " + err);
         }
 
-        return path;
+        return hash;
     }
 }

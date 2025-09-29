@@ -1,9 +1,16 @@
-import { ChunkedUploaderClient } from "./ChunkedUploaderClient";
+import { UploaderClient } from "./UploaderClient";
 
 export {
     ChunkedUploaderClient,
-    ProgressState,
-    UploadState,
+    LegacyEndpoints,
 } from "./ChunkedUploaderClient";
 
-export default ChunkedUploaderClient;
+export {
+    ChunkedUploaderClientProps,
+    Endpoints,
+    ProgressState,
+    RequestInitOptions,
+    UploadState,
+} from "./types";
+
+export default UploaderClient;
