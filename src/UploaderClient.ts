@@ -53,9 +53,21 @@ export class UploaderClient {
         });
     }
 
-    async upload(file: File, chunkSize: number): Promise<string> {
+    /**
+     * Upload a file in chunks.
+     * @param file The file to upload.
+     * @param size The size of each chunk. -1 means upload in a single chunk.
+     * @returns The upload ID.
+     */
+    async upload(
+        file: File,
+        size: number,
+        overwrite?: boolean
+    ): Promise<string> {
         this.aborted = false;
         this.abortController = new AbortController();
+        const isUploadSingleChunk = size === -1;
+        const chunkSize = isUploadSingleChunk ? file.size : size;
 
         let { upload, finish } = this.config.endpoints;
         this.abortController = new AbortController();
@@ -141,12 +153,17 @@ export class UploaderClient {
             const formData = new FormData();
             formData.append("file", chunk);
 
+            const headers: Record<string, string> = {
+                ...(this.config.headers as Record<string, string>),
+            };
+
+            if (!overwrite) {
+                headers["Range"] = `offset=${start}-${end}`;
+            }
+
             const p = fetch(upload, {
-                method: "APPEND",
-                headers: {
-                    ...this.config.headers,
-                    Range: `offset=${start}-${end}`,
-                },
+                method: overwrite ? "PUT" : "POST",
+                headers,
                 body: formData,
                 signal: this.abortController.signal,
             })
