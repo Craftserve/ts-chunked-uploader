@@ -16,14 +16,32 @@ export class UploaderClient {
         state: UploadState.Initializing,
     };
 
+    // ---- new fields for throttling ----
+    private lastProgressReportTime: number = 0;
+    private lastReportedUploaded: number = 0;
+    private progressIntervalMs: number;
+    private progressBytesThreshold: number;
+    // ------------------------------------
+
     constructor(config: ChunkedUploaderClientProps) {
         this.config = config;
+
+        // Allow optional overrides in config (no type change required at types file):
+        const cfgAny = this.config as any;
+        this.progressIntervalMs = cfgAny.progressReportIntervalMs ?? 1000; // default 1s
+        this.progressBytesThreshold = cfgAny.progressReportBytes ?? 1_000_000; // default 1MB
     }
 
     onprogress(cb: (state: ProgressState) => void): () => void {
         this.progressCallback = cb;
 
-        cb(this.lastProgress);
+        // keep previous behaviour: immediately call with lastProgress
+        try {
+            cb(this.lastProgress);
+        } catch (e) {
+            console.error("progress callback error:", e);
+        }
+
         return () => {
             if (this.progressCallback === cb) {
                 this.progressCallback = undefined;
@@ -31,10 +49,47 @@ export class UploaderClient {
         };
     }
 
-    private reportProgress(state: ProgressState) {
+    /**
+     * Reports progress but throttles frequent updates.
+     * force = true -> always call callback (used for important states/errors).
+     */
+    private reportProgress(state: ProgressState, force = false) {
+        // Always keep the lastProgress up to date (even if we don't notify callback every time).
         this.lastProgress = state;
+
+        // If no callback - nothing to throttle
+        if (!this.progressCallback) return;
+
+        const now = Date.now();
+
+        // Always report immediately for terminal/important states
+        const importantStates = new Set<UploadState>([
+            UploadState.Initializing,
+            UploadState.Finishing,
+            UploadState.Done,
+            UploadState.Error,
+        ]);
+
+        const uploaded = state.uploaded ?? this.lastProgress.uploaded ?? 0;
+
+        const timeSinceLast = now - this.lastProgressReportTime;
+        const bytesSinceLast = Math.max(
+            0,
+            uploaded - this.lastReportedUploaded
+        );
+
+        const shouldReport =
+            force ||
+            importantStates.has(state.state) ||
+            timeSinceLast >= this.progressIntervalMs ||
+            bytesSinceLast >= this.progressBytesThreshold;
+
+        if (!shouldReport) return;
+
         try {
-            if (this.progressCallback) this.progressCallback(state);
+            this.progressCallback(state);
+            this.lastProgressReportTime = now;
+            this.lastReportedUploaded = uploaded;
         } catch (e) {
             console.error("progress callback error:", e);
         }
@@ -46,11 +101,15 @@ export class UploaderClient {
             this.abortController.abort();
         }
 
-        this.reportProgress({
-            uploaded: this.lastProgress.uploaded,
-            total: this.lastProgress.total,
-            state: UploadState.Error,
-        });
+        // force immediate error report
+        this.reportProgress(
+            {
+                uploaded: this.lastProgress.uploaded,
+                total: this.lastProgress.total,
+                state: UploadState.Error,
+            },
+            true
+        );
     }
 
     /**
@@ -75,11 +134,14 @@ export class UploaderClient {
         const total = file.size;
         let uploaded = 0;
 
-        this.reportProgress({
-            uploaded: 0,
-            total,
-            state: UploadState.Initializing,
-        });
+        this.reportProgress(
+            {
+                uploaded: 0,
+                total,
+                state: UploadState.Initializing,
+            },
+            true
+        );
 
         const sha256: string = await new Promise((resolve, reject) => {
             const reader = new FileReader();
@@ -96,11 +158,14 @@ export class UploaderClient {
                         resolve(hashHex);
                     })
                     .catch((err) => {
-                        this.reportProgress({
-                            uploaded,
-                            total,
-                            state: UploadState.Error,
-                        });
+                        this.reportProgress(
+                            {
+                                uploaded,
+                                total,
+                                state: UploadState.Error,
+                            },
+                            true
+                        );
                         reject(
                             new Error("Failed to calculate checksum: " + err)
                         );
@@ -108,22 +173,28 @@ export class UploaderClient {
             };
 
             reader.onerror = () => {
-                this.reportProgress({
-                    uploaded,
-                    total,
-                    state: UploadState.Error,
-                });
+                this.reportProgress(
+                    {
+                        uploaded,
+                        total,
+                        state: UploadState.Error,
+                    },
+                    true
+                );
                 reject(new Error("Failed to read file: " + reader.error));
             };
 
             try {
                 reader.readAsArrayBuffer(file);
             } catch (err) {
-                this.reportProgress({
-                    uploaded,
-                    total,
-                    state: UploadState.Error,
-                });
+                this.reportProgress(
+                    {
+                        uploaded,
+                        total,
+                        state: UploadState.Error,
+                    },
+                    true
+                );
                 reject(err);
             }
         });
@@ -133,11 +204,14 @@ export class UploaderClient {
         upload = upload.replace("{upload_id}", upload_id);
         finish = finish.replace("{upload_id}", upload_id);
 
-        this.reportProgress({
-            uploaded: 0,
-            total,
-            state: UploadState.Uploading,
-        });
+        this.reportProgress(
+            {
+                uploaded: 0,
+                total,
+                state: UploadState.Uploading,
+            },
+            true
+        );
 
         const chunks = Math.ceil(file.size / chunkSize);
         const promises: Promise<void>[] = [];
@@ -177,6 +251,7 @@ export class UploaderClient {
                     uploaded += chunkLength;
 
                     if (uploaded > total) uploaded = total;
+                    // non-forced update -> will be throttled
                     this.reportProgress({
                         uploaded,
                         total,
@@ -186,18 +261,24 @@ export class UploaderClient {
                 })
                 .catch((err) => {
                     if (this.aborted) {
-                        this.reportProgress({
+                        this.reportProgress(
+                            {
+                                uploaded,
+                                total,
+                                state: UploadState.Error,
+                            },
+                            true
+                        );
+                        throw new Error("Upload aborted");
+                    }
+                    this.reportProgress(
+                        {
                             uploaded,
                             total,
                             state: UploadState.Error,
-                        });
-                        throw new Error("Upload aborted");
-                    }
-                    this.reportProgress({
-                        uploaded,
-                        total,
-                        state: UploadState.Error,
-                    });
+                        },
+                        true
+                    );
                     throw err;
                 });
 
@@ -205,7 +286,10 @@ export class UploaderClient {
         }
 
         if (this.aborted) {
-            this.reportProgress({ uploaded, total, state: UploadState.Error });
+            this.reportProgress(
+                { uploaded, total, state: UploadState.Error },
+                true
+            );
             throw new Error("Upload aborted during checksum calculation");
         }
 
@@ -215,20 +299,26 @@ export class UploaderClient {
             await Promise.all(promises);
 
             if (this.aborted) {
-                this.reportProgress({
-                    uploaded,
-                    total,
-                    state: UploadState.Error,
-                });
+                this.reportProgress(
+                    {
+                        uploaded,
+                        total,
+                        state: UploadState.Error,
+                    },
+                    true
+                );
                 throw new Error("Upload aborted during chunk upload");
             }
 
             uploaded = total;
-            this.reportProgress({
-                uploaded,
-                total,
-                state: UploadState.Finishing,
-            });
+            this.reportProgress(
+                {
+                    uploaded,
+                    total,
+                    state: UploadState.Finishing,
+                },
+                true
+            );
 
             const response = await fetch(finish, {
                 method: "GET",
@@ -237,11 +327,14 @@ export class UploaderClient {
             });
 
             if (response.status !== 201) {
-                this.reportProgress({
-                    uploaded,
-                    total,
-                    state: UploadState.Error,
-                });
+                this.reportProgress(
+                    {
+                        uploaded,
+                        total,
+                        state: UploadState.Error,
+                    },
+                    true
+                );
                 throw new Error(
                     "Failed to finish upload. Checksum mismatch or server error."
                 );
@@ -267,13 +360,19 @@ export class UploaderClient {
                 await this.config.onFinalize(upload_id);
             }
 
-            this.reportProgress({
-                uploaded: total,
-                total,
-                state: UploadState.Done,
-            });
+            this.reportProgress(
+                {
+                    uploaded: total,
+                    total,
+                    state: UploadState.Done,
+                },
+                true
+            );
         } catch (err) {
-            this.reportProgress({ uploaded, total, state: UploadState.Error });
+            this.reportProgress(
+                { uploaded, total, state: UploadState.Error },
+                true
+            );
             throw new Error("Failed to upload file: " + err);
         }
 
