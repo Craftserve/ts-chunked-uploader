@@ -232,9 +232,9 @@ export class UploaderClient {
             const chunk = file.slice(start, end);
             const chunkLength = end - start;
 
-            const formData = new FormData();
-            const chunkFile = new File([chunk], file.name, { type: file.type });
-            formData.append("file", chunkFile);
+            // const formData = new FormData();
+            // const chunkFile = new File([chunk], file.name, { type: file.type });
+            // formData.append("file", chunk);
 
             // clone headers
             const headers: Record<string, string> = {
@@ -399,7 +399,11 @@ export class UploaderClient {
                 };
 
                 try {
-                    xhr.send(formData);
+                    xhr.setRequestHeader(
+                        "Content-type",
+                        file.type || "application/octet-stream"
+                    );
+                    xhr.send(chunk);
                 } catch (err) {
                     if (this.abortController) {
                         try {
