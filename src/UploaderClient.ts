@@ -465,7 +465,7 @@ export class UploaderClient {
                 signal: this.abortController?.signal,
             });
 
-            if (response.status !== 201) {
+            if (response.status !== 200) {
                 this.reportProgress(
                     {
                         uploaded,
@@ -488,11 +488,15 @@ export class UploaderClient {
             hash = data.hash;
 
             if (hash !== sha256) {
-                throw new Error("Checksum mismatch after upload");
+                throw new Error(
+                    `Checksum mismatch after upload. Expected ${sha256}, got ${hash}`
+                );
             }
 
             if (data.length !== total) {
-                throw new Error("Uploaded length mismatch after upload");
+                throw new Error(
+                    `Uploaded length mismatch after upload. Expected ${total}, got ${data.length}`
+                );
             }
 
             if (this.config.onFinalize) {
