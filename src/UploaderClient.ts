@@ -130,7 +130,7 @@ export class UploaderClient {
         const isUploadSingleChunk = size === -1;
         const chunkSize = isUploadSingleChunk ? file.size : size;
 
-        console.log("running upload with chunk size: v2", chunkSize);
+        console.log("running upload with chunk size: v3", chunkSize);
 
         let { upload, finish } = this.config.endpoints;
         // single abortController is enough for all XHRs/fetches
@@ -233,7 +233,8 @@ export class UploaderClient {
             const chunkLength = end - start;
 
             const formData = new FormData();
-            formData.append("file", chunk);
+            const chunkFile = new File([chunk], file.name, { type: file.type });
+            formData.append("file", chunkFile);
 
             // clone headers
             const headers: Record<string, string> = {
