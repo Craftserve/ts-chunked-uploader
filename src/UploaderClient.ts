@@ -206,7 +206,15 @@ export class UploaderClient {
 
         const upload_id = sha256;
 
+        // Create URL
         upload = upload.replace("{upload_id}", upload_id);
+
+        if (overwrite === false) {
+            const url = new URL(upload, window.location.origin);
+            url.searchParams.set("create", "1");
+            upload = url.toString();
+        }
+
         finish = finish.replace("{upload_id}", upload_id);
 
         this.reportProgress(
@@ -275,7 +283,7 @@ export class UploaderClient {
                 }
 
                 // open
-                xhr.open(overwrite ? "PUT" : "POST", upload, true);
+                xhr.open("PUT", upload, true);
 
                 // If config.headers contains 'credentials' (e.g. "include"), map to xhr.withCredentials
                 const cfgAny = this.config as any;
