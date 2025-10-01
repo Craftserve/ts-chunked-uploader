@@ -130,7 +130,7 @@ export class UploaderClient {
         const isUploadSingleChunk = size === -1;
         const chunkSize = isUploadSingleChunk ? file.size : size;
 
-        console.log("running upload with chunk size", chunkSize);
+        console.log("running upload with chunk size: v2", chunkSize);
 
         let { upload, finish } = this.config.endpoints;
         // single abortController is enough for all XHRs/fetches
@@ -302,9 +302,11 @@ export class UploaderClient {
                 }
 
                 // progress event for this chunk
-                xhr.upload.onprogress = (ev: ProgressEvent) => {
+                xhr.upload.onprogress = (ev) => {
                     // ev.loaded = bytes uploaded for this request
                     // clamp to chunkLength if lengthComputable and ev.total equals chunkLength
+                    console.log("xhr.upload.onprogress", ev);
+
                     const loaded = Math.min(
                         chunkLength,
                         ev.lengthComputable ? ev.loaded : ev.loaded
