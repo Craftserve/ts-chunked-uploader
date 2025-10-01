@@ -245,10 +245,6 @@ export class UploaderClient {
                 ...(this.config.headers as Record<string, string>),
             };
 
-            if (!overwrite) {
-                headers["Range"] = `offset=${start}-${end}`;
-            }
-
             // Create XHR-based promise for the chunk
             const p = new Promise<void>((resolve, reject) => {
                 // If aborted already, don't start
@@ -304,6 +300,10 @@ export class UploaderClient {
                     }
                 } catch (e) {
                     // ignore
+                }
+
+                if (chunks > 1) {
+                    headers["Range"] = `offset=${start}-${end}`;
                 }
 
                 // progress event for this chunk
