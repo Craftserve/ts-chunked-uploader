@@ -120,11 +120,7 @@ export class UploaderClient {
      * @param overwrite Whether to overwrite existing data. Default is false (append).
      * @returns The upload ID.
      */
-    async upload(
-        file: File,
-        size: number,
-        overwrite?: boolean
-    ): Promise<string> {
+    async upload(file: File, size: number, overwrite = false): Promise<string> {
         this.aborted = false;
         this.abortController = new AbortController();
         const isUploadSingleChunk = size === -1;
