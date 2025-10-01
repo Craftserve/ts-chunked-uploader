@@ -56,6 +56,7 @@ export class UploaderClient {
     private reportProgress(state: ProgressState, force = false) {
         // Always keep the lastProgress up to date (even if we don't notify callback every time).
         this.lastProgress = state;
+        console.log("report progress", state);
 
         // If no callback - nothing to throttle
         if (!this.progressCallback) return;
@@ -116,6 +117,7 @@ export class UploaderClient {
      * Upload a file in chunks.
      * @param file The file to upload.
      * @param size The size of each chunk. -1 means upload in a single chunk.
+     * @param overwrite Whether to overwrite existing data. Default is false (append).
      * @returns The upload ID.
      */
     async upload(
@@ -127,6 +129,8 @@ export class UploaderClient {
         this.abortController = new AbortController();
         const isUploadSingleChunk = size === -1;
         const chunkSize = isUploadSingleChunk ? file.size : size;
+
+        console.log("running upload with chunk size", chunkSize);
 
         let { upload, finish } = this.config.endpoints;
         // single abortController is enough for all XHRs/fetches
