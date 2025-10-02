@@ -123,10 +123,8 @@ export class UploaderClient {
     async upload(file: File, size: number, overwrite = false): Promise<string> {
         this.aborted = false;
         this.abortController = new AbortController();
-        const isUploadSingleChunk = size === -1;
+        const isUploadSingleChunk = size === -1 || size >= file.size;
         const chunkSize = isUploadSingleChunk ? file.size : size;
-
-        console.log("running upload with chunk size: v3", chunkSize);
 
         let { upload, finish } = this.config.endpoints;
         // single abortController is enough for all XHRs/fetches
@@ -224,6 +222,13 @@ export class UploaderClient {
 
         const chunks = Math.ceil(file.size / chunkSize);
         const promises: Promise<void>[] = [];
+
+        console.log(
+            "running upload with chunk size: v3",
+            chunkSize,
+            isUploadSingleChunk,
+            chunks
+        );
 
         // track progress per chunk for smooth overall progress
         const progressPerChunk: number[] = new Array(chunks).fill(0);
