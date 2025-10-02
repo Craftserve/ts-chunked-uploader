@@ -292,7 +292,7 @@ export class UploaderClient {
 
                 // add Range header for all except single-chunk upload. If this will not be added, server will overwrite previous chunk with the last one.
                 if (chunks > 1) {
-                    headers["Range"] = `offset=${start}-${end}`;
+                    headers["Range"] = `bytes=${start}-${end}`;
                 }
 
                 // Set headers (skip Content-Type and skip 'credentials' pseudo-header)
