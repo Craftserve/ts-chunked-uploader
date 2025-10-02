@@ -56,7 +56,6 @@ export class UploaderClient {
     private reportProgress(state: ProgressState, force = false) {
         // Always keep the lastProgress up to date (even if we don't notify callback every time).
         this.lastProgress = state;
-        console.log("report progress", state);
 
         // If no callback - nothing to throttle
         if (!this.progressCallback) return;
@@ -223,13 +222,6 @@ export class UploaderClient {
         const chunks = Math.ceil(file.size / chunkSize);
         const promises: Promise<void>[] = [];
 
-        console.log(
-            "running upload with chunk size: v3",
-            chunkSize,
-            isUploadSingleChunk,
-            chunks
-        );
-
         // track progress per chunk for smooth overall progress
         const progressPerChunk: number[] = new Array(chunks).fill(0);
 
@@ -245,7 +237,6 @@ export class UploaderClient {
                 ...(this.config.headers as Record<string, string>),
             };
 
-            // Każdy chunk w osobnym await
             await new Promise<void>((resolve, reject) => {
                 if (this.aborted) {
                     this.reportProgress(
