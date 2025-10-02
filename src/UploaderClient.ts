@@ -290,6 +290,11 @@ export class UploaderClient {
                     xhr.withCredentials = true;
                 }
 
+                // add Range header for all except single-chunk upload. If this will not be added, server will overwrite previous chunk with the last one.
+                if (chunks > 1) {
+                    headers["Range"] = `offset=${start}-${end}`;
+                }
+
                 // Set headers (skip Content-Type and skip 'credentials' pseudo-header)
                 try {
                     for (const [k, v] of Object.entries(headers)) {
@@ -305,10 +310,6 @@ export class UploaderClient {
                     }
                 } catch (e) {
                     // ignore
-                }
-
-                if (chunks > 1) {
-                    headers["Range"] = `offset=${start}-${end}`;
                 }
 
                 // progress event for this chunk
