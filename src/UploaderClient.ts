@@ -241,18 +241,12 @@ export class UploaderClient {
             const chunk = file.slice(start, end);
             const chunkLength = end - start;
 
-            // const formData = new FormData();
-            // const chunkFile = new File([chunk], file.name, { type: file.type });
-            // formData.append("file", chunk);
-
-            // clone headers
             const headers: Record<string, string> = {
                 ...(this.config.headers as Record<string, string>),
             };
 
-            // Create XHR-based promise for the chunk
-            const p = new Promise<void>((resolve, reject) => {
-                // If aborted already, don't start
+            // Każdy chunk w osobnym await
+            await new Promise<void>((resolve, reject) => {
                 if (this.aborted) {
                     this.reportProgress(
                         { uploaded, total, state: UploadState.Error },
@@ -263,26 +257,24 @@ export class UploaderClient {
 
                 const xhr = new XMLHttpRequest();
 
-                // Integrate AbortController with XHR
                 const onAbort = () => {
                     try {
                         xhr.abort();
-                    } catch (e) {}
+                    } catch {}
                 };
                 if (this.abortController) {
-                    try {
-                        this.abortController.signal.addEventListener(
-                            "abort",
-                            onAbort,
-                            { once: true }
-                        );
-                    } catch (e) {}
+                    this.abortController.signal.addEventListener(
+                        "abort",
+                        onAbort,
+                        {
+                            once: true,
+                        }
+                    );
                 }
 
-                // open
                 xhr.open("PUT", upload, true);
 
-                // If config.headers contains 'credentials' (e.g. "include"), map to xhr.withCredentials
+                // credentials handling
                 const cfgAny = this.config as any;
                 const maybeCredentials = (cfgAny.headers &&
                     (cfgAny.headers as any).credentials) as string | undefined;
@@ -290,34 +282,21 @@ export class UploaderClient {
                     xhr.withCredentials = true;
                 }
 
-                // add Range header for all except single-chunk upload. If this will not be added, server will overwrite previous chunk with the last one.
                 if (chunks > 1) {
                     headers["Range"] = `bytes=${start}-${end}`;
                 }
 
-                // Set headers (skip Content-Type and skip 'credentials' pseudo-header)
-                try {
-                    for (const [k, v] of Object.entries(headers)) {
-                        if (!v) continue;
-                        const lower = k.toLowerCase();
-                        if (lower === "content-type") continue;
-                        if (lower === "credentials") continue;
-                        try {
-                            xhr.setRequestHeader(k, v);
-                        } catch (e) {
-                            // ignore invalid headers
-                        }
-                    }
-                } catch (e) {
-                    // ignore
+                for (const [k, v] of Object.entries(headers)) {
+                    if (!v) continue;
+                    const lower = k.toLowerCase();
+                    if (lower === "content-type" || lower === "credentials")
+                        continue;
+                    try {
+                        xhr.setRequestHeader(k, v);
+                    } catch {}
                 }
 
-                // progress event for this chunk
                 xhr.upload.onprogress = (ev) => {
-                    // ev.loaded = bytes uploaded for this request
-                    // clamp to chunkLength if lengthComputable and ev.total equals chunkLength
-                    console.log("xhr.upload.onprogress", ev);
-
                     const loaded = Math.min(
                         chunkLength,
                         ev.lengthComputable ? ev.loaded : ev.loaded
@@ -326,7 +305,6 @@ export class UploaderClient {
                     uploaded = progressPerChunk.reduce((a, b) => a + b, 0);
                     if (uploaded > total) uploaded = total;
 
-                    // non-forced update -> will be throttled
                     this.reportProgress({
                         uploaded,
                         total,
@@ -336,25 +314,20 @@ export class UploaderClient {
                 };
 
                 xhr.onload = () => {
-                    // remove abort listener
                     if (this.abortController) {
-                        try {
-                            this.abortController.signal.removeEventListener(
-                                "abort",
-                                onAbort
-                            );
-                        } catch (e) {}
+                        this.abortController.signal.removeEventListener(
+                            "abort",
+                            onAbort
+                        );
                     }
 
                     if (xhr.status >= 200 && xhr.status < 300) {
-                        // ensure this chunk is considered fully uploaded
                         progressPerChunk[i] = chunkLength;
                         uploaded = Math.min(
                             total,
                             progressPerChunk.reduce((a, b) => a + b, 0)
                         );
 
-                        // final per-chunk update after completion (throttled)
                         this.reportProgress({
                             uploaded,
                             total,
@@ -378,12 +351,10 @@ export class UploaderClient {
 
                 xhr.onerror = () => {
                     if (this.abortController) {
-                        try {
-                            this.abortController.signal.removeEventListener(
-                                "abort",
-                                onAbort
-                            );
-                        } catch (e) {}
+                        this.abortController.signal.removeEventListener(
+                            "abort",
+                            onAbort
+                        );
                     }
                     this.reportProgress(
                         { uploaded, total, state: UploadState.Error },
@@ -394,12 +365,10 @@ export class UploaderClient {
 
                 xhr.onabort = () => {
                     if (this.abortController) {
-                        try {
-                            this.abortController.signal.removeEventListener(
-                                "abort",
-                                onAbort
-                            );
-                        } catch (e) {}
+                        this.abortController.signal.removeEventListener(
+                            "abort",
+                            onAbort
+                        );
                     }
                     this.reportProgress(
                         { uploaded, total, state: UploadState.Error },
@@ -416,12 +385,10 @@ export class UploaderClient {
                     xhr.send(chunk);
                 } catch (err) {
                     if (this.abortController) {
-                        try {
-                            this.abortController.signal.removeEventListener(
-                                "abort",
-                                onAbort
-                            );
-                        } catch (e) {}
+                        this.abortController.signal.removeEventListener(
+                            "abort",
+                            onAbort
+                        );
                     }
                     this.reportProgress(
                         { uploaded, total, state: UploadState.Error },
@@ -429,12 +396,7 @@ export class UploaderClient {
                     );
                     reject(err);
                 }
-            }).catch((err) => {
-                // propagate errors but keep type as Promise<void>
-                throw err;
             });
-
-            promises.push(p);
         }
 
         if (this.aborted) {
