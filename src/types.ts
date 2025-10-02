@@ -14,6 +14,7 @@ export interface ChunkedUploaderClientProps {
     onFinalize?: (upload_id: string) => Promise<void>;
     headers?: HeadersInit;
     initOptions?: RequestInitOptions;
+    alg?: "SHA-256";
 }
 
 export enum UploadState {

@@ -1,3 +1,4 @@
+import { formatHashFromApi } from "./helpers/formatHash";
 import {
     ChunkedUploaderClientProps,
     ProgressState,
@@ -8,6 +9,7 @@ export class UploaderClient {
     private config: ChunkedUploaderClientProps;
     private abortController?: AbortController;
     private aborted = false;
+    private DefaultHashAlg = "sha-256";
 
     private progressCallback?: (s: ProgressState) => void;
     private lastProgress: ProgressState = {
@@ -128,6 +130,7 @@ export class UploaderClient {
         let hash = "";
 
         let { upload, finish } = this.config.endpoints;
+        const alg = this.config.alg || this.DefaultHashAlg;
         // single abortController is enough for all XHRs/fetches
         this.abortController = new AbortController();
 
@@ -149,7 +152,7 @@ export class UploaderClient {
             reader.onload = (e) => {
                 const buffer = e.target!.result as ArrayBuffer;
                 crypto.subtle
-                    .digest("SHA-256", buffer)
+                    .digest(alg.toUpperCase(), buffer)
                     .then((res) => {
                         const hashArray = Array.from(new Uint8Array(res));
                         const binaryString = String.fromCharCode(...hashArray);
@@ -318,7 +321,7 @@ export class UploaderClient {
                             xhr.getResponseHeader("Content-Digest");
 
                         if (headerHash) {
-                            hash = headerHash;
+                            hash = formatHashFromApi(headerHash, alg);
                         }
                     }
 
@@ -461,7 +464,7 @@ export class UploaderClient {
                     throw new Error("No hash returned from server");
                 }
 
-                hash = data.hash;
+                hash = formatHashFromApi(data.hash, alg);
 
                 if (data.length !== total) {
                     throw new Error(
