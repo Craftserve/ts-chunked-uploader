@@ -124,6 +124,8 @@ export class UploaderClient {
         this.abortController = new AbortController();
         const isUploadSingleChunk = size === -1 || size >= file.size;
         const chunkSize = isUploadSingleChunk ? file.size : size;
+        // server hash response. Can be obtained from upload (when uploading single chunk) or finish endpoint
+        let hash = "";
 
         let { upload, finish } = this.config.endpoints;
         // single abortController is enough for all XHRs/fetches
@@ -145,15 +147,14 @@ export class UploaderClient {
             const reader = new FileReader();
 
             reader.onload = (e) => {
-                const buffer = e.target!.result;
+                const buffer = e.target!.result as ArrayBuffer;
                 crypto.subtle
-                    .digest("SHA-256", buffer as ArrayBuffer)
+                    .digest("SHA-256", buffer)
                     .then((res) => {
                         const hashArray = Array.from(new Uint8Array(res));
-                        const hashHex = hashArray
-                            .map((b) => b.toString(16).padStart(2, "0"))
-                            .join("");
-                        resolve(hashHex);
+                        const binaryString = String.fromCharCode(...hashArray);
+                        const hashBase64 = btoa(binaryString);
+                        resolve(hashBase64);
                     })
                     .catch((err) => {
                         this.reportProgress(
@@ -312,6 +313,15 @@ export class UploaderClient {
                         );
                     }
 
+                    if (chunks === 1) {
+                        const headerHash =
+                            xhr.getResponseHeader("Content-Digest");
+
+                        if (headerHash) {
+                            hash = headerHash;
+                        }
+                    }
+
                     if (xhr.status >= 200 && xhr.status < 300) {
                         progressPerChunk[i] = chunkLength;
                         uploaded = Math.min(
@@ -398,8 +408,6 @@ export class UploaderClient {
             throw new Error("Upload aborted during checksum calculation");
         }
 
-        let hash = "";
-
         try {
             await Promise.all(promises);
 
@@ -426,43 +434,45 @@ export class UploaderClient {
                 true
             );
 
-            const response = await fetch(finish, {
-                method: "GET",
-                headers: this.config.headers,
-                signal: this.abortController?.signal,
-            });
+            if (!hash) {
+                const response = await fetch(finish, {
+                    method: "GET",
+                    headers: this.config.headers,
+                    signal: this.abortController?.signal,
+                });
 
-            if (response.status !== 200) {
-                this.reportProgress(
-                    {
-                        uploaded,
-                        total,
-                        state: UploadState.Error,
-                    },
-                    true
-                );
-                throw new Error(
-                    "Failed to finish upload. Checksum mismatch or server error."
-                );
+                if (response.status !== 200) {
+                    this.reportProgress(
+                        {
+                            uploaded,
+                            total,
+                            state: UploadState.Error,
+                        },
+                        true
+                    );
+                    throw new Error(
+                        "Failed to finish upload. Checksum mismatch or server error."
+                    );
+                }
+
+                const data = await response.json();
+
+                if (!data.hash || !data.length) {
+                    throw new Error("No hash returned from server");
+                }
+
+                hash = data.hash;
+
+                if (data.length !== total) {
+                    throw new Error(
+                        `Uploaded length mismatch after upload. Expected ${total}, got ${data.length}`
+                    );
+                }
             }
-
-            const data = await response.json();
-
-            if (!data.hash || !data.length) {
-                throw new Error("No hash returned from server");
-            }
-
-            hash = data.hash;
 
             if (hash !== sha256) {
                 throw new Error(
                     `Checksum mismatch after upload. Expected ${sha256}, got ${hash}`
-                );
-            }
-
-            if (data.length !== total) {
-                throw new Error(
-                    `Uploaded length mismatch after upload. Expected ${total}, got ${data.length}`
                 );
             }
 
