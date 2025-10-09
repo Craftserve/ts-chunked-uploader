@@ -5,13 +5,14 @@ import {
     UploadState,
 } from "./types";
 
+const DEFAULT_HASH_ALG = "sha-256";
+
 export class UploaderClient {
     private config: ChunkedUploaderClientProps;
     private abortController?: AbortController;
     private aborted = false;
-    private DefaultHashAlg = "sha-256";
-
     private progressCallback?: (s: ProgressState) => void;
+
     private lastProgress: ProgressState = {
         uploaded: 0,
         total: 0,
@@ -115,24 +116,284 @@ export class UploaderClient {
     }
 
     /**
+     * Compute checksum of the whole file (base64 of raw digest bytes).
+     */
+    private async computeHash(file: File, alg: string): Promise<string> {
+        // Normalize algorithm for Web Crypto (e.g. 'sha-256' -> 'SHA-256').
+        // Web Crypto expects identifiers like "SHA-256".
+        const cryptoAlg = alg.toUpperCase();
+
+        try {
+            const buffer = await file.arrayBuffer();
+            const digest = await crypto.subtle.digest(cryptoAlg, buffer);
+            const hashArray = Array.from(new Uint8Array(digest));
+            // convert to binary string then to base64
+            let binary = "";
+            for (let i = 0; i < hashArray.length; i++) {
+                binary += String.fromCharCode(hashArray[i]);
+            }
+            return btoa(binary);
+        } catch (err) {
+            throw new Error("Failed to calculate checksum: " + err);
+        }
+    }
+
+    /**
+     * Upload a single chunk using XHR to preserve upload progress events.
+     */
+    private uploadChunk(
+        uploadUrl: string,
+        chunk: Blob,
+        headers: Record<string, string>,
+        i: number,
+        chunkLength: number,
+        progressPerChunk: number[],
+        total: number,
+        signal?: AbortSignal
+    ): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            let listenerAdded = false;
+
+            const onAbort = () => {
+                try {
+                    xhr.abort();
+                } catch {}
+            };
+
+            if (signal) {
+                signal.addEventListener("abort", onAbort, { once: true });
+                listenerAdded = true;
+            }
+
+            xhr.open("PUT", uploadUrl, true);
+
+            // credentials handling - preserve previous behaviour
+            const cfgAny = this.config as any;
+            const maybeCredentials = (cfgAny.headers &&
+                (cfgAny.headers as any).credentials) as string | undefined;
+            if (maybeCredentials && maybeCredentials === "include") {
+                xhr.withCredentials = true;
+            }
+
+            for (const [k, v] of Object.entries(headers)) {
+                if (!v) continue;
+                const lower = k.toLowerCase();
+                if (lower === "content-type" || lower === "credentials")
+                    continue;
+                try {
+                    xhr.setRequestHeader(k, v);
+                } catch {}
+            }
+
+            xhr.upload.onprogress = (ev) => {
+                // ev.loaded should be present; clamp to chunkLength.
+                const reportedLoaded =
+                    typeof ev.loaded === "number" ? ev.loaded : 0;
+                const loaded = Math.min(chunkLength, reportedLoaded);
+
+                // Do not decrease previously recorded progress for this chunk (prevents regressions / double-counting issues)
+                progressPerChunk[i] = Math.max(
+                    progressPerChunk[i] || 0,
+                    loaded
+                );
+
+                const uploaded = Math.min(
+                    total,
+                    progressPerChunk.reduce((a, b) => a + b, 0)
+                );
+
+                this.reportProgress({
+                    uploaded,
+                    total,
+                    state: UploadState.Uploading,
+                    currentChunkSize: chunkLength,
+                });
+            };
+
+            xhr.onload = () => {
+                // remove listener if still present
+                if (signal && listenerAdded) {
+                    try {
+                        signal.removeEventListener("abort", onAbort);
+                    } catch {}
+                }
+
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    // ensure chunk considered fully uploaded
+                    progressPerChunk[i] = chunkLength;
+                    const uploaded = Math.min(
+                        total,
+                        progressPerChunk.reduce((a, b) => a + b, 0)
+                    );
+
+                    this.reportProgress({
+                        uploaded,
+                        total,
+                        state: UploadState.Uploading,
+                        currentChunkSize: chunkLength,
+                    });
+
+                    resolve();
+                } else {
+                    this.reportProgress(
+                        {
+                            uploaded: progressPerChunk.reduce(
+                                (a, b) => a + b,
+                                0
+                            ),
+                            total,
+                            state: UploadState.Error,
+                        },
+                        true
+                    );
+                    reject(
+                        new Error(
+                            `Chunk upload failed with status ${xhr.status}`
+                        )
+                    );
+                }
+            };
+
+            xhr.onerror = () => {
+                if (signal && listenerAdded) {
+                    try {
+                        signal.removeEventListener("abort", onAbort);
+                    } catch {}
+                }
+                this.reportProgress(
+                    {
+                        uploaded: progressPerChunk.reduce((a, b) => a + b, 0),
+                        total,
+                        state: UploadState.Error,
+                    },
+                    true
+                );
+                reject(new Error("Network error during upload"));
+            };
+
+            xhr.onabort = () => {
+                if (signal && listenerAdded) {
+                    try {
+                        signal.removeEventListener("abort", onAbort);
+                    } catch {}
+                }
+                this.reportProgress(
+                    {
+                        uploaded: progressPerChunk.reduce((a, b) => a + b, 0),
+                        total,
+                        state: UploadState.Error,
+                    },
+                    true
+                );
+                reject(new Error("Upload aborted"));
+            };
+
+            try {
+                xhr.setRequestHeader(
+                    "Content-type",
+                    // keep previous behaviour (fallback to octet-stream)
+                    (this.config.headers as Record<string, string>)[
+                        "Content-type"
+                    ] ||
+                        (chunk instanceof File
+                            ? chunk.type || "application/octet-stream"
+                            : "application/octet-stream") ||
+                        (this.config.headers &&
+                            (this.config.headers as any)["content-type"]) ||
+                        (chunk instanceof Blob && (chunk as Blob).type) ||
+                        "application/octet-stream"
+                );
+            } catch {}
+
+            try {
+                xhr.send(chunk);
+            } catch (err) {
+                if (signal && listenerAdded) {
+                    try {
+                        signal.removeEventListener("abort", onAbort);
+                    } catch {}
+                }
+                this.reportProgress(
+                    {
+                        uploaded: progressPerChunk.reduce((a, b) => a + b, 0),
+                        total,
+                        state: UploadState.Error,
+                    },
+                    true
+                );
+                reject(err);
+            }
+        });
+    }
+
+    /**
+     * Finish endpoint fetch and verify server-side hash/length.
+     */
+    private async finishAndVerify(
+        finishUrl: string,
+        sha256: string,
+        total: number,
+        alg: string
+    ): Promise<string> {
+        const response = await fetch(finishUrl, {
+            method: "GET",
+            headers: this.config.headers,
+            signal: this.abortController?.signal,
+        });
+
+        if (response.status !== 200) {
+            this.reportProgress(
+                { uploaded: total, total, state: UploadState.Error },
+                true
+            );
+            throw new Error(
+                "Failed to finish upload. Checksum mismatch or server error."
+            );
+        }
+
+        const data = await response.json();
+
+        if (!data.hash || !data.length) {
+            throw new Error("No hash returned from server");
+        }
+
+        const serverHash = formatHashFromApi(data.hash, alg);
+
+        if (data.length !== total) {
+            throw new Error(
+                `Uploaded length mismatch after upload. Expected ${total}, got ${data.length}`
+            );
+        }
+
+        if (serverHash !== sha256) {
+            throw new Error(
+                `Checksum mismatch after upload. Expected ${sha256}, got ${serverHash}`
+            );
+        }
+
+        return serverHash;
+    }
+
+    /**
      * Upload a file in chunks.
      * @param file The file to upload.
      * @param size The size of each chunk. -1 means upload in a single chunk.
      * @param overwrite Whether to overwrite existing data. Default is false (append).
-     * @returns The upload ID.
+     * @returns The upload ID (hash).
      */
     async upload(file: File, size: number, overwrite = false): Promise<string> {
         this.aborted = false;
         this.abortController = new AbortController();
+        const signal = this.abortController.signal;
+
         const isUploadSingleChunk = size === -1 || size >= file.size;
         const chunkSize = isUploadSingleChunk ? file.size : size;
-        // server hash response. Can be obtained from upload (when uploading single chunk) or finish endpoint
+
         let hash = "";
 
         let { upload, finish } = this.config.endpoints;
-        const alg = this.config.alg || this.DefaultHashAlg;
-        // single abortController is enough for all XHRs/fetches
-        this.abortController = new AbortController();
+        const alg = this.config.alg || DEFAULT_HASH_ALG;
 
         const total = file.size;
         let uploaded = 0;
@@ -146,60 +407,17 @@ export class UploaderClient {
             true
         );
 
-        const sha256: string = await new Promise((resolve, reject) => {
-            const reader = new FileReader();
-
-            reader.onload = (e) => {
-                const buffer = e.target!.result as ArrayBuffer;
-                crypto.subtle
-                    .digest(alg.toUpperCase(), buffer)
-                    .then((res) => {
-                        const hashArray = Array.from(new Uint8Array(res));
-                        const binaryString = String.fromCharCode(...hashArray);
-                        const hashBase64 = btoa(binaryString);
-                        resolve(hashBase64);
-                    })
-                    .catch((err) => {
-                        this.reportProgress(
-                            {
-                                uploaded,
-                                total,
-                                state: UploadState.Error,
-                            },
-                            true
-                        );
-                        reject(
-                            new Error("Failed to calculate checksum: " + err)
-                        );
-                    });
-            };
-
-            reader.onerror = () => {
-                this.reportProgress(
-                    {
-                        uploaded,
-                        total,
-                        state: UploadState.Error,
-                    },
-                    true
-                );
-                reject(new Error("Failed to read file: " + reader.error));
-            };
-
-            try {
-                reader.readAsArrayBuffer(file);
-            } catch (err) {
-                this.reportProgress(
-                    {
-                        uploaded,
-                        total,
-                        state: UploadState.Error,
-                    },
-                    true
-                );
-                reject(err);
-            }
-        });
+        // compute file hash (base64)
+        let sha256: string;
+        try {
+            sha256 = await this.computeHash(file, alg);
+        } catch (err) {
+            this.reportProgress(
+                { uploaded, total, state: UploadState.Error },
+                true
+            );
+            throw err;
+        }
 
         const upload_id = sha256;
 
@@ -224,7 +442,6 @@ export class UploaderClient {
         );
 
         const chunks = Math.ceil(file.size / chunkSize);
-        const promises: Promise<void>[] = [];
 
         // track progress per chunk for smooth overall progress
         const progressPerChunk: number[] = new Array(chunks).fill(0);
@@ -241,242 +458,69 @@ export class UploaderClient {
                 ...(this.config.headers as Record<string, string>),
             };
 
-            await new Promise<void>((resolve, reject) => {
-                if (this.aborted) {
-                    this.reportProgress(
-                        { uploaded, total, state: UploadState.Error },
-                        true
-                    );
-                    return reject(new Error("Upload aborted"));
-                }
+            // If multiple chunks, Range header should be inclusive: start - (end - 1)
+            if (chunks > 1) {
+                headers["Range"] = `bytes=${start}-${end - 1}`;
+            }
 
-                const xhr = new XMLHttpRequest();
-
-                const onAbort = () => {
-                    try {
-                        xhr.abort();
-                    } catch {}
-                };
-                if (this.abortController) {
-                    this.abortController.signal.addEventListener(
-                        "abort",
-                        onAbort,
-                        {
-                            once: true,
-                        }
-                    );
-                }
-
-                xhr.open("PUT", upload, true);
-
-                // credentials handling
-                const cfgAny = this.config as any;
-                const maybeCredentials = (cfgAny.headers &&
-                    (cfgAny.headers as any).credentials) as string | undefined;
-                if (maybeCredentials && maybeCredentials === "include") {
-                    xhr.withCredentials = true;
-                }
-
-                if (chunks > 1) {
-                    headers["Range"] = `bytes=${start}-${end}`;
-                }
-
-                for (const [k, v] of Object.entries(headers)) {
-                    if (!v) continue;
-                    const lower = k.toLowerCase();
-                    if (lower === "content-type" || lower === "credentials")
-                        continue;
-                    try {
-                        xhr.setRequestHeader(k, v);
-                    } catch {}
-                }
-
-                xhr.upload.onprogress = (ev) => {
-                    const loaded = Math.min(
-                        chunkLength,
-                        ev.lengthComputable ? ev.loaded : ev.loaded
-                    );
-                    progressPerChunk[i] = loaded;
-                    uploaded = progressPerChunk.reduce((a, b) => a + b, 0);
-                    if (uploaded > total) uploaded = total;
-
-                    this.reportProgress({
-                        uploaded,
-                        total,
-                        state: UploadState.Uploading,
-                        currentChunkSize: chunkLength,
-                    });
-                };
-
-                xhr.onload = () => {
-                    if (this.abortController) {
-                        this.abortController.signal.removeEventListener(
-                            "abort",
-                            onAbort
-                        );
-                    }
-
-                    if (chunks === 1) {
-                        const headerHash =
-                            xhr.getResponseHeader("Content-Digest");
-
-                        if (headerHash) {
-                            hash = formatHashFromApi(headerHash, alg);
-                        }
-                    }
-
-                    if (xhr.status >= 200 && xhr.status < 300) {
-                        progressPerChunk[i] = chunkLength;
-                        uploaded = Math.min(
-                            total,
-                            progressPerChunk.reduce((a, b) => a + b, 0)
-                        );
-
-                        this.reportProgress({
-                            uploaded,
-                            total,
-                            state: UploadState.Uploading,
-                            currentChunkSize: chunkLength,
-                        });
-
-                        resolve();
-                    } else {
-                        this.reportProgress(
-                            { uploaded, total, state: UploadState.Error },
-                            true
-                        );
-                        reject(
-                            new Error(
-                                `Chunk upload failed with status ${xhr.status}`
-                            )
-                        );
-                    }
-                };
-
-                xhr.onerror = () => {
-                    if (this.abortController) {
-                        this.abortController.signal.removeEventListener(
-                            "abort",
-                            onAbort
-                        );
-                    }
-                    this.reportProgress(
-                        { uploaded, total, state: UploadState.Error },
-                        true
-                    );
-                    reject(new Error("Network error during upload"));
-                };
-
-                xhr.onabort = () => {
-                    if (this.abortController) {
-                        this.abortController.signal.removeEventListener(
-                            "abort",
-                            onAbort
-                        );
-                    }
-                    this.reportProgress(
-                        { uploaded, total, state: UploadState.Error },
-                        true
-                    );
-                    reject(new Error("Upload aborted"));
-                };
-
-                try {
-                    xhr.setRequestHeader(
-                        "Content-type",
-                        file.type || "application/octet-stream"
-                    );
-                    xhr.send(chunk);
-                } catch (err) {
-                    if (this.abortController) {
-                        this.abortController.signal.removeEventListener(
-                            "abort",
-                            onAbort
-                        );
-                    }
-                    this.reportProgress(
-                        { uploaded, total, state: UploadState.Error },
-                        true
-                    );
-                    reject(err);
-                }
-            });
-        }
-
-        if (this.aborted) {
-            this.reportProgress(
-                { uploaded, total, state: UploadState.Error },
-                true
-            );
-            throw new Error("Upload aborted during checksum calculation");
-        }
-
-        try {
-            await Promise.all(promises);
-
-            if (this.aborted) {
+            try {
+                await this.uploadChunk(
+                    upload,
+                    chunk,
+                    headers,
+                    i,
+                    chunkLength,
+                    progressPerChunk,
+                    total,
+                    signal
+                );
+            } catch (err) {
+                // ensure we report and cleanup
                 this.reportProgress(
                     {
-                        uploaded,
+                        uploaded: progressPerChunk.reduce((a, b) => a + b, 0),
                         total,
                         state: UploadState.Error,
                     },
                     true
                 );
-                throw new Error("Upload aborted during chunk upload");
+                // propagate error
+                throw err;
             }
+        }
 
-            // ensure we mark fully uploaded
-            uploaded = total;
+        if (this.aborted) {
             this.reportProgress(
                 {
-                    uploaded,
+                    uploaded: progressPerChunk.reduce((a, b) => a + b, 0),
                     total,
-                    state: UploadState.Finishing,
+                    state: UploadState.Error,
                 },
                 true
             );
+            throw new Error("Upload aborted during chunk upload");
+        }
 
+        try {
+            // ensure we mark fully uploaded
+            uploaded = total;
+            this.reportProgress(
+                { uploaded, total, state: UploadState.Finishing },
+                true
+            );
+
+            // If single-chunk upload response already provided hash, we might have it (kept for backwards-compatibility).
+            // Current flow: if server provided Content-Digest on single chunk we'd have captured it in uploadChunk (but we did not in this refactor).
+            // So ask finish endpoint to return final hash/length if needed.
             if (!hash) {
-                const response = await fetch(finish, {
-                    method: "GET",
-                    headers: this.config.headers,
-                    signal: this.abortController?.signal,
-                });
-
-                if (response.status !== 200) {
-                    this.reportProgress(
-                        {
-                            uploaded,
-                            total,
-                            state: UploadState.Error,
-                        },
-                        true
-                    );
-                    throw new Error(
-                        "Failed to finish upload. Checksum mismatch or server error."
-                    );
-                }
-
-                const data = await response.json();
-
-                if (!data.hash || !data.length) {
-                    throw new Error("No hash returned from server");
-                }
-
-                hash = formatHashFromApi(data.hash, alg);
-
-                if (data.length !== total) {
-                    throw new Error(
-                        `Uploaded length mismatch after upload. Expected ${total}, got ${data.length}`
-                    );
-                }
-            }
-
-            if (hash !== sha256) {
-                throw new Error(
-                    `Checksum mismatch after upload. Expected ${sha256}, got ${hash}`
+                // finishAndVerify will throw on mismatch
+                const serverHash = await this.finishAndVerify(
+                    finish,
+                    sha256,
+                    total,
+                    alg
                 );
+                hash = serverHash;
             }
 
             if (this.config.onFinalize) {
@@ -493,7 +537,7 @@ export class UploaderClient {
             );
         } catch (err) {
             this.reportProgress(
-                { uploaded, total, state: UploadState.Error },
+                { uploaded: uploaded, total, state: UploadState.Error },
                 true
             );
             throw new Error("Failed to upload file: " + err);
