@@ -1,12 +1,12 @@
 {
     "name": "@craftserve/ts-chunked-uploader",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "TS client for chunked-uplaoder",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "publishConfig": {
-    "registry": "https://npm.pkg.github.com/"
-  },
+        "registry": "https://npm.pkg.github.com/"
+    },
     "scripts": {
         "build": "tsc",
         "prepare": "npm run build",
