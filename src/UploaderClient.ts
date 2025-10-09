@@ -158,7 +158,9 @@ export class UploaderClient {
             const onAbort = () => {
                 try {
                     xhr.abort();
-                } catch {}
+                } catch {
+                    console.error("Failed to abort xhr");
+                }
             };
 
             if (signal) {
