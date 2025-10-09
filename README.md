@@ -151,11 +151,3 @@ jobs:
 
 -   Każdy tag `vX.Y.Z` automatycznie wywoła publikację (jeśli używasz workflowa powyżej).
 -   W przypadku błędów „unauthorized” upewnij się, że masz poprawne uprawnienia `write:packages`.
-
----
-
-## 📄 Licencja
-
-Wewnętrzna biblioteka Craftserve. Nie przeznaczona do publicznego udostępniania poza organizacją.
-
----
