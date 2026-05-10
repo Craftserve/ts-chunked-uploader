@@ -487,7 +487,7 @@ export class UploaderClient {
       true,
     );
 
-    const chunks = Math.ceil(file.size / chunkSize);
+    const chunks = file.size === 0 ? 1 : Math.ceil(file.size / chunkSize);
 
     // track progress per chunk for smooth overall progress
     const progressPerChunk: number[] = new Array(chunks).fill(0);
