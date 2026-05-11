@@ -184,6 +184,15 @@ export function bytesToBase64(bytes: Uint8Array): string {
 }
 
 /**
+ * Convert a std-base64 string to base64url (RFC 4648 §5): '+'→'-', '/'→'_',
+ * trailing '=' padding stripped. Matches the transform applied to upload_id
+ * inside UploaderClient.upload().
+ */
+export function toBase64Url(s: string): string {
+  return s.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
  * Compute the expected hash for a file of given length, matching the
  * deterministic crypto stub above.
  */

@@ -466,15 +466,18 @@ export class UploaderClient {
       throw err;
     }
 
-    const upload_id = sha256;
-
-    // The standard base64 alphabet contains '+', '/' and '=' — characters
-    // that are unsafe in URL path/query segments. We must URL-encode the
-    // upload_id before substituting it into the endpoint templates,
-    // otherwise a '/' in the hash splits the path into a new segment and
-    // the server routes the request to the wrong handler.
-    const encoded_upload_id = encodeURIComponent(upload_id);
-    upload = upload.replace("{upload_id}", encoded_upload_id);
+    // The upload_id is used as a URL path segment, so it must not contain
+    // characters from the standard base64 alphabet that are unsafe in URLs
+    // ('+', '/', '='). We derive a base64url variant (RFC 4648 §5) of the
+    // SHA-256 specifically for the path identifier.
+    //
+    // The compare value (`sha256`) stays in std-base64 because that's what
+    // the daemon emits in the `finish` response — see WEB-1549.
+    const upload_id = sha256
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    upload = upload.replace("{upload_id}", upload_id);
 
     if (overwrite === false) {
       const url = new URL(upload, window.location.origin);
@@ -482,7 +485,7 @@ export class UploaderClient {
       upload = url.toString();
     }
 
-    finish = finish.replace("{upload_id}", encoded_upload_id);
+    finish = finish.replace("{upload_id}", upload_id);
 
     this.reportProgress(
       {
@@ -641,7 +644,10 @@ export class UploaderClient {
       }
 
       if (this.config.onFinalize) {
-        await this.config.onFinalize(upload_id);
+        // Pass the std-base64 SHA-256 (not the base64url path identifier) —
+        // matches the value returned by `upload()` and what callers received
+        // before WEB-1549 split the path identifier from the hash.
+        await this.config.onFinalize(sha256);
       }
 
       this.reportProgress(

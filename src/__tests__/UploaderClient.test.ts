@@ -8,6 +8,7 @@ import {
   installFetchStub,
   makeFile,
   tick,
+  toBase64Url,
 } from "./testUtils";
 
 const UPLOAD_URL = "/api/uploads/{upload_id}/chunk";
@@ -57,10 +58,9 @@ describe("UploaderClient", () => {
       await MockXHR.waitForCount(1);
       const xhr = MockXHR.last();
       expect(xhr.method).toBe("PUT");
-      // upload_id is the file's computed hash, URL-encoded before substitution
-      // (so '=' / '+' / '/' from base64 are safely escaped). See "URL safety"
-      // test below for the empty-file regression.
-      expect(xhr.url).toContain(encodeURIComponent(expectedHash));
+      // upload_id is base64url(sha256) — URL-safe, no '+' / '/' / '=' to escape.
+      // See "URL safety" tests below for the empty-file regression.
+      expect(xhr.url).toContain(toBase64Url(expectedHash));
       // Single chunk should NOT have a Range header.
       expect(xhr.requestHeaders["Range"]).toBeUndefined();
 
@@ -72,7 +72,8 @@ describe("UploaderClient", () => {
 
       // finish was called, onFinalize was awaited.
       expect(fetchStub.calls.length).toBe(1);
-      expect(fetchStub.calls[0].url).toContain(encodeURIComponent(expectedHash));
+      expect(fetchStub.calls[0].url).toContain(toBase64Url(expectedHash));
+      // onFinalize gets the std-base64 hash (not the base64url path id).
       expect(onFinalize).toHaveBeenCalledWith(expectedHash);
 
       // Terminal state == Done; Initializing and Finishing also seen.
@@ -699,7 +700,7 @@ describe("UploaderClient", () => {
   // ---------- URL safety ----------
 
   describe("URL safety", () => {
-    it("URL-encodes the '=' padding from base64 upload_id", async () => {
+    it("uses base64url upload_id in the URL (no '+' / '/' / '=' in path)", async () => {
       const fetchStub = installFetchStub();
       const bytes = new Uint8Array(4).fill(1);
       const file = makeFile(bytes);
@@ -712,21 +713,21 @@ describe("UploaderClient", () => {
       const p = client.upload(file, -1);
       await MockXHR.waitForCount(1);
       const url = MockXHR.last().url;
-      // The encoded form is in the URL; the raw '=' padding is not.
-      expect(url).toContain(encodeURIComponent(h));
-      if (h.endsWith("=")) {
-        // Raw hash with trailing '=' should NOT appear verbatim in the path.
-        expect(url).not.toContain(h);
-      }
+      // Base64url form appears in the URL.
+      expect(url).toContain(toBase64Url(h));
+      // The path segment that holds upload_id must contain none of '+' / '/' / '=' /
+      // their percent-encoded forms.
+      const pathSegment = new URL(url).pathname;
+      expect(pathSegment).not.toMatch(/[+=]|%2B|%2F|%3D/i);
       MockXHR.last().finishOK(200);
       await p;
     });
 
-    // Regression for the production failure: uploading an empty file produces
-    // upload_id = base64(SHA-256("")) = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
-    // which contains a literal '/' in the middle. Without URL-encoding, that
-    // slash splits the path into a new segment and the server 404s.
-    it("URL-encodes '+' and '/' inside upload_id (empty-file SHA-256 regression)", async () => {
+    // WEB-1549 regression: uploading an empty file yields
+    //   std-base64(SHA-256("")) = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+    // which contains a literal '/' that would split the path. base64url turns
+    // that into "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU" — single segment.
+    it("uses base64url for the empty-file SHA-256 upload_id (WEB-1549)", async () => {
       const fetchStub = installFetchStub();
       const file = makeFile(new Uint8Array(0));
 
@@ -736,13 +737,15 @@ describe("UploaderClient", () => {
         0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
         0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
       ]);
-      const rawHash = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+      const stdBase64 = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+      const base64url = "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU";
       (globalThis as any).crypto.subtle.digest = async () =>
         emptyHashBytes.buffer.slice(0);
 
+      // Daemon returns std-base64 in `hash` field — we keep that compare value.
       fetchStub.queue.push({
         status: 200,
-        body: { hash: rawHash, length: 0 },
+        body: { hash: stdBase64, length: 0 },
       });
 
       const client = new UploaderClient({
@@ -752,20 +755,21 @@ describe("UploaderClient", () => {
       await MockXHR.waitForCount(1);
 
       const xhrUrl = MockXHR.last().url;
-      // Must contain percent-encoded '/' and '+', not the raw characters.
-      expect(xhrUrl).toContain("%2F");
-      expect(xhrUrl).toContain("%2B");
-      // The raw hash string would split the path on its '/' — must not appear.
-      expect(xhrUrl).not.toContain(rawHash);
+      // URL contains the base64url form; raw std-base64 absent (no '+/=').
+      expect(xhrUrl).toContain(base64url);
+      expect(xhrUrl).not.toContain(stdBase64);
+      // Triple-check the path segment is clean.
+      expect(new URL(xhrUrl).pathname).not.toMatch(/[+=]|%2B|%2F|%3D/i);
 
       MockXHR.last().finishOK(200);
-      await expect(p).resolves.toBe(rawHash);
+      // upload() resolves to the std-base64 hash (server-emitted, used for
+      // compare) — NOT the base64url path identifier.
+      await expect(p).resolves.toBe(stdBase64);
 
-      // Same guarantee on the finish endpoint.
+      // Same guarantee on the finish endpoint URL.
       const finishUrl = fetchStub.calls[0].url;
-      expect(finishUrl).toContain("%2F");
-      expect(finishUrl).toContain("%2B");
-      expect(finishUrl).not.toContain(rawHash);
+      expect(finishUrl).toContain(base64url);
+      expect(finishUrl).not.toContain(stdBase64);
     });
   });
 

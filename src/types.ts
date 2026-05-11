@@ -36,7 +36,13 @@ export interface ChunkRetryInfo {
 
 export interface ChunkedUploaderClientProps {
     endpoints: Endpoints;
-    onFinalize?: (upload_id: string) => Promise<void>;
+    /**
+     * Called after `finish` succeeds and the server hash has been verified.
+     * Receives the **std-base64** SHA-256 of the file (the same value that
+     * `upload()` returns and that the server reports in `FinishResponse.hash`).
+     * Not the base64url path identifier used in URLs.
+     */
+    onFinalize?: (sha256: string) => Promise<void>;
     headers?: HeadersInit;
     initOptions?: RequestInitOptions;
     alg?: "SHA-256";

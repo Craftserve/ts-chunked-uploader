@@ -74,9 +74,11 @@ Biblioteka nie definiuje endpointów ani ich nie tworzy — jedynie wywołuje dw
 
 -   **Metoda:** `PUT`
 -   **URL:** wzorzec z `{upload_id}`, np. `/api/uploads/{upload_id}/chunk`.
-    `{upload_id}` to **base64** ze skrótu SHA‑256 całego pliku, podstawiany
-    przez klienta. W przypadku pierwszego chunka (gdy `overwrite=false`)
-    klient dodaje query `?create=1`.
+    `{upload_id}` to **base64url** (RFC 4648 §5, bez padding `=`) ze skrótu
+    SHA‑256 całego pliku — to jest tylko identyfikator dla URL‑a, nie wartość
+    do porównywania (patrz `finish` poniżej).
+    W przypadku pierwszego chunka (gdy `overwrite=false`) klient dodaje
+    query `?create=1`.
 -   **Nagłówki:**
     -   `Range: bytes=<start>-<end-1>` — **tylko gdy plik jest dzielony na
         wiele chunków**. Dla single‑chunk (`size = -1` albo `size >= file.size`)
@@ -96,23 +98,33 @@ Biblioteka nie definiuje endpointów ani ich nie tworzy — jedynie wywołuje dw
 
     ```ts
     interface FinishResponse {
-        hash: string; // skrót pliku po stronie serwera; opcjonalny prefiks
-        // algorytmu jest tolerowany, np. "sha-256=…"
+        hash: string; // skrót pliku po stronie serwera w **standard base64**
+        // (alfabet z '+/='). Opcjonalny prefiks algorytmu jest tolerowany,
+        // np. "sha-256=…"
         length: number; // liczba zapisanych bajtów; MUSI równać się file.size
         // ─ wartość 0 jest poprawna dla pustego pliku
     }
     ```
 
     Każdy inny status traktowany jest jako błąd (`Failed to finish upload`).
-    Klient porównuje `hash` z lokalnie wyliczonym SHA‑256 (po stripowaniu
-    prefiksu `alg=`) oraz `length` z `file.size`; rozbieżność → wyjątek
-    `Checksum mismatch` / `length mismatch`.
+    Klient porównuje `hash` z lokalnie wyliczonym SHA‑256 w **standard
+    base64** (po stripowaniu prefiksu `alg=`) oraz `length` z `file.size`;
+    rozbieżność → wyjątek `Checksum mismatch` / `length mismatch`.
+
+> **Uwaga o alfabetach.** Klient celowo używa dwóch kodowań tej samej wartości
+> SHA‑256:
+> - **base64url** w segmencie URL‑a `{upload_id}` — bezpieczne ścieżkowo,
+>   bez `+`, `/`, `=`.
+> - **standard base64** w polu `hash` z `finish` (kontrakt z daemonem) — wartość
+>   porównywana lokalnie, zwracana przez `upload()`, przekazywana do
+>   `onFinalize`.
 
 ### `onFinalize` (opcjonalne)
 
 Jeśli skonfigurowane, jest wywoływane **po** udanej weryfikacji `finish`,
-z `upload_id` jako argumentem. Wyjątek z callbacka zatrzymuje upload i jest
-propagowany jako `Failed to upload file: …`.
+z **standard‑base64 SHA‑256** pliku jako argumentem (tą samą wartością, którą
+zwraca `upload()` — nie z base64url używanym w URL). Wyjątek z callbacka
+zatrzymuje upload i jest propagowany jako `Failed to upload file: …`.
 
 ---
 

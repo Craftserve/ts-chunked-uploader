@@ -1,6 +1,6 @@
 {
   "name": "@craftserve/ts-chunked-uploader",
-  "version": "1.1.0-beta.1",
+  "version": "1.1.0-beta.2",
   "description": "TS client for chunked-uplaoder",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
