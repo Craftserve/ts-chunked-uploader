@@ -2,6 +2,7 @@ import { formatHashFromApi } from "./helpers/formatHash";
 import {
   ChunkedUploaderClientProps,
   ChunkRetryInfo,
+  FinishResponse,
   ProgressState,
   UploadState,
 } from "./types";
@@ -377,7 +378,7 @@ export class UploaderClient {
   }
 
   /**
-   * Finish endpoint fetch and verify server-side hash/length.
+   * Finish endpoint fetch and verify server-side hash/length
    */
   private async finishAndVerify(
     finishUrl: string,
@@ -401,9 +402,9 @@ export class UploaderClient {
       );
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as Partial<FinishResponse>;
 
-    if (!data.hash || !data.length) {
+    if (typeof data.hash !== "string" || typeof data.length !== "number") {
       throw new Error("No hash returned from server");
     }
 
@@ -429,7 +430,7 @@ export class UploaderClient {
    * @param file The file to upload.
    * @param size The size of each chunk. -1 means upload in a single chunk.
    * @param overwrite Whether to overwrite existing data. Default is false (append).
-   * @returns The upload ID (hash).
+   * @returns The base64url upload ID (same as used in the upload URL path).
    */
   async upload(file: File, size: number, overwrite = false): Promise<string> {
     this.aborted = false;
@@ -438,8 +439,6 @@ export class UploaderClient {
 
     const isUploadSingleChunk = size === -1 || size >= file.size;
     const chunkSize = isUploadSingleChunk ? file.size : size;
-
-    let hash = "";
 
     let { upload, finish } = this.config.endpoints;
     const alg = this.config.alg || DEFAULT_HASH_ALG;
@@ -465,10 +464,18 @@ export class UploaderClient {
       throw err;
     }
 
-    const upload_id = sha256;
-
-    // Create URL
-    upload = upload.replace("{upload_id}", upload_id);
+    // The upload_id is used as a URL path segment, so it must not contain
+    // characters from the standard base64 alphabet that are unsafe in URLs
+    // ('+', '/', '='). We derive a base64url variant (RFC 4648 §5) of the
+    // SHA-256 specifically for the path identifier.
+    //
+    // The compare value (`sha256`) stays in std-base64 because that's what
+    // the daemon emits in the `finish` response — see WEB-1549.
+    const uploadId = sha256
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    upload = upload.replace("{upload_id}", uploadId);
 
     if (overwrite === false) {
       const url = new URL(upload, window.location.origin);
@@ -476,7 +483,7 @@ export class UploaderClient {
       upload = url.toString();
     }
 
-    finish = finish.replace("{upload_id}", upload_id);
+    finish = finish.replace("{upload_id}", uploadId);
 
     this.reportProgress(
       {
@@ -620,22 +627,12 @@ export class UploaderClient {
         true,
       );
 
-      // If single-chunk upload response already provided hash, we might have it (kept for backwards-compatibility).
-      // Current flow: if server provided Content-Digest on single chunk we'd have captured it in uploadChunk (but we did not in this refactor).
-      // So ask finish endpoint to return final hash/length if needed.
-      if (!hash) {
-        // finishAndVerify will throw on mismatch
-        const serverHash = await this.finishAndVerify(
-          finish,
-          sha256,
-          total,
-          alg,
-        );
-        hash = serverHash;
-      }
+      // finishAndVerify will throw on mismatch
+      await this.finishAndVerify(finish, sha256, total, alg);
 
       if (this.config.onFinalize) {
-        await this.config.onFinalize(upload_id);
+        // Pass the std-base64 SHA-256 (not the base64url path identifier).
+        await this.config.onFinalize(sha256);
       }
 
       this.reportProgress(
@@ -654,6 +651,6 @@ export class UploaderClient {
       throw new Error("Failed to upload file: " + err);
     }
 
-    return hash;
+    return uploadId;
   }
 }
