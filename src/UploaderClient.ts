@@ -468,8 +468,13 @@ export class UploaderClient {
 
     const upload_id = sha256;
 
-    // Create URL
-    upload = upload.replace("{upload_id}", upload_id);
+    // The standard base64 alphabet contains '+', '/' and '=' — characters
+    // that are unsafe in URL path/query segments. We must URL-encode the
+    // upload_id before substituting it into the endpoint templates,
+    // otherwise a '/' in the hash splits the path into a new segment and
+    // the server routes the request to the wrong handler.
+    const encoded_upload_id = encodeURIComponent(upload_id);
+    upload = upload.replace("{upload_id}", encoded_upload_id);
 
     if (overwrite === false) {
       const url = new URL(upload, window.location.origin);
@@ -477,7 +482,7 @@ export class UploaderClient {
       upload = url.toString();
     }
 
-    finish = finish.replace("{upload_id}", upload_id);
+    finish = finish.replace("{upload_id}", encoded_upload_id);
 
     this.reportProgress(
       {

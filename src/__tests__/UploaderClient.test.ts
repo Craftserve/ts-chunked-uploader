@@ -57,11 +57,10 @@ describe("UploaderClient", () => {
       await MockXHR.waitForCount(1);
       const xhr = MockXHR.last();
       expect(xhr.method).toBe("PUT");
-      // upload_id should be the file's computed hash (URL-substituted, RAW).
-      // NOTE: The library does NOT URL-encode the upload_id before substituting
-      // into the upload URL, so base64 padding ('=') and '+' / '/' characters
-      // are inserted verbatim. See "URL safety" test below.
-      expect(xhr.url).toContain(expectedHash);
+      // upload_id is the file's computed hash, URL-encoded before substitution
+      // (so '=' / '+' / '/' from base64 are safely escaped). See "URL safety"
+      // test below for the empty-file regression.
+      expect(xhr.url).toContain(encodeURIComponent(expectedHash));
       // Single chunk should NOT have a Range header.
       expect(xhr.requestHeaders["Range"]).toBeUndefined();
 
@@ -73,7 +72,7 @@ describe("UploaderClient", () => {
 
       // finish was called, onFinalize was awaited.
       expect(fetchStub.calls.length).toBe(1);
-      expect(fetchStub.calls[0].url).toContain(expectedHash);
+      expect(fetchStub.calls[0].url).toContain(encodeURIComponent(expectedHash));
       expect(onFinalize).toHaveBeenCalledWith(expectedHash);
 
       // Terminal state == Done; Initializing and Finishing also seen.
@@ -700,13 +699,7 @@ describe("UploaderClient", () => {
   // ---------- URL safety ----------
 
   describe("URL safety", () => {
-    // ❗BUG (potential): base64 hashes commonly end in '=' padding and may
-    // contain '+' or '/'. The library substitutes {upload_id} verbatim, so
-    // these characters land in the URL path/query unescaped. Servers that
-    // try to URL-decode the upload_id from the path will see a transformed
-    // value (e.g. '+' becomes space). This test documents the current
-    // behavior so a future encodeURIComponent fix breaks it intentionally.
-    it("substitutes {upload_id} verbatim (no URL encoding of base64)", async () => {
+    it("URL-encodes the '=' padding from base64 upload_id", async () => {
       const fetchStub = installFetchStub();
       const bytes = new Uint8Array(4).fill(1);
       const file = makeFile(bytes);
@@ -718,15 +711,61 @@ describe("UploaderClient", () => {
       });
       const p = client.upload(file, -1);
       await MockXHR.waitForCount(1);
-      // The raw base64 (with '=' padding) appears unescaped in the URL.
       const url = MockXHR.last().url;
-      expect(url).toContain(h);
-      // Confirm we did NOT URL-encode the '=' padding.
+      // The encoded form is in the URL; the raw '=' padding is not.
+      expect(url).toContain(encodeURIComponent(h));
       if (h.endsWith("=")) {
-        expect(url).not.toContain(encodeURIComponent(h));
+        // Raw hash with trailing '=' should NOT appear verbatim in the path.
+        expect(url).not.toContain(h);
       }
       MockXHR.last().finishOK(200);
       await p;
+    });
+
+    // Regression for the production failure: uploading an empty file produces
+    // upload_id = base64(SHA-256("")) = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+    // which contains a literal '/' in the middle. Without URL-encoding, that
+    // slash splits the path into a new segment and the server 404s.
+    it("URL-encodes '+' and '/' inside upload_id (empty-file SHA-256 regression)", async () => {
+      const fetchStub = installFetchStub();
+      const file = makeFile(new Uint8Array(0));
+
+      // Force the digest stub to return the canonical SHA-256("") bytes.
+      const emptyHashBytes = new Uint8Array([
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8,
+        0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+      ]);
+      const rawHash = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+      (globalThis as any).crypto.subtle.digest = async () =>
+        emptyHashBytes.buffer.slice(0);
+
+      fetchStub.queue.push({
+        status: 200,
+        body: { hash: rawHash, length: 0 },
+      });
+
+      const client = new UploaderClient({
+        endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
+      });
+      const p = client.upload(file, -1);
+      await MockXHR.waitForCount(1);
+
+      const xhrUrl = MockXHR.last().url;
+      // Must contain percent-encoded '/' and '+', not the raw characters.
+      expect(xhrUrl).toContain("%2F");
+      expect(xhrUrl).toContain("%2B");
+      // The raw hash string would split the path on its '/' — must not appear.
+      expect(xhrUrl).not.toContain(rawHash);
+
+      MockXHR.last().finishOK(200);
+      await expect(p).resolves.toBe(rawHash);
+
+      // Same guarantee on the finish endpoint.
+      const finishUrl = fetchStub.calls[0].url;
+      expect(finishUrl).toContain("%2F");
+      expect(finishUrl).toContain("%2B");
+      expect(finishUrl).not.toContain(rawHash);
     });
   });
 
