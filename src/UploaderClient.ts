@@ -378,7 +378,7 @@ export class UploaderClient {
   }
 
   /**
-   * Finish endpoint fetch and verify server-side hash/length.
+   * Finish endpoint fetch and verify server-side hash/length
    */
   private async finishAndVerify(
     finishUrl: string,
