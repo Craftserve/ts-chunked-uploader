@@ -65,6 +65,57 @@ setTimeout(() => uploader.abort(), 5000);
 
 ---
 
+## 🔌 Kontrakt z backendem
+
+Biblioteka nie definiuje endpointów ani ich nie tworzy — jedynie wywołuje dwa
+ścieżki podane w `endpoints`. Backend musi zachowywać się następująco:
+
+### `upload` — przesyłanie chunków
+
+-   **Metoda:** `PUT`
+-   **URL:** wzorzec z `{upload_id}`, np. `/api/uploads/{upload_id}/chunk`.
+    `{upload_id}` to **base64** ze skrótu SHA‑256 całego pliku, podstawiany
+    przez klienta. W przypadku pierwszego chunka (gdy `overwrite=false`)
+    klient dodaje query `?create=1`.
+-   **Nagłówki:**
+    -   `Range: bytes=<start>-<end-1>` — **tylko gdy plik jest dzielony na
+        wiele chunków**. Dla single‑chunk (`size = -1` albo `size >= file.size`)
+        nagłówek `Range` nie jest wysyłany.
+    -   `Content-Type` — typ pliku albo `application/octet-stream`.
+    -   Dowolne nagłówki dodatkowe z `config.headers` (np. `Authorization`).
+-   **Body:** surowe bajty chunka (`Blob`), bez `multipart/form-data`.
+-   **Odpowiedź:** dowolne `2xx` traktowane jest jako sukces. `4xx` to błąd
+    nieretryowalny (klient propaguje wyjątek), `5xx` i błąd sieci są
+    retryowane zgodnie z `maxChunkRetries` / `chunkRetryDelayMs`.
+
+### `finish` — weryfikacja i finalizacja
+
+-   **Metoda:** `GET`
+-   **URL:** wzorzec z `{upload_id}`, np. `/api/uploads/{upload_id}/finish`.
+-   **Odpowiedź:** **`200 OK`** z ciałem JSON o kształcie [`FinishResponse`](./src/types.ts):
+
+    ```ts
+    interface FinishResponse {
+        hash: string; // skrót pliku po stronie serwera; opcjonalny prefiks
+        // algorytmu jest tolerowany, np. "sha-256=…"
+        length: number; // liczba zapisanych bajtów; MUSI równać się file.size
+        // ─ wartość 0 jest poprawna dla pustego pliku
+    }
+    ```
+
+    Każdy inny status traktowany jest jako błąd (`Failed to finish upload`).
+    Klient porównuje `hash` z lokalnie wyliczonym SHA‑256 (po stripowaniu
+    prefiksu `alg=`) oraz `length` z `file.size`; rozbieżność → wyjątek
+    `Checksum mismatch` / `length mismatch`.
+
+### `onFinalize` (opcjonalne)
+
+Jeśli skonfigurowane, jest wywoływane **po** udanej weryfikacji `finish`,
+z `upload_id` jako argumentem. Wyjątek z callbacka zatrzymuje upload i jest
+propagowany jako `Failed to upload file: …`.
+
+---
+
 ## ⚙️ Konfiguracja
 
 | Parametr                   | Typ                      | Opis                                                            |

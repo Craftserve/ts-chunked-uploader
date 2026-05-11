@@ -3,6 +3,23 @@ export interface Endpoints {
     finish: string;
 }
 
+/**
+ * Response body returned by the `finish` endpoint.
+ * The client compares these against the locally computed checksum and
+ * the original `file.size` to verify integrity end-to-end.
+ *
+ *  - `hash`   — server-side digest of the assembled upload. May be sent
+ *               prefixed with the algorithm (e.g. `"sha-256=…"`); the
+ *               client strips the prefix before comparing.
+ *  - `length` — total bytes stored by the server. MUST equal the size
+ *               of the uploaded file (0 is a valid value for empty
+ *               files).
+ */
+export interface FinishResponse {
+    hash: string;
+    length: number;
+}
+
 export interface RequestInitOptions {
     body?: {
         [key: string]: any;

@@ -2,6 +2,7 @@ import { formatHashFromApi } from "./helpers/formatHash";
 import {
   ChunkedUploaderClientProps,
   ChunkRetryInfo,
+  FinishResponse,
   ProgressState,
   UploadState,
 } from "./types";
@@ -401,9 +402,9 @@ export class UploaderClient {
       );
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as Partial<FinishResponse>;
 
-    if (!data.hash || !data.length) {
+    if (typeof data.hash !== "string" || typeof data.length !== "number") {
       throw new Error("No hash returned from server");
     }
 

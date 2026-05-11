@@ -9,6 +9,7 @@ export {
     ChunkedUploaderClientProps,
     ChunkRetryInfo,
     Endpoints,
+    FinishResponse,
     ProgressState,
     RequestInitOptions,
     UploadState,

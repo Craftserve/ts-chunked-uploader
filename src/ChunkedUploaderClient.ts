@@ -68,7 +68,8 @@ export class ChunkedUploaderClient {
         this.aborted = false;
         this.abortController = new AbortController();
 
-        let { init, upload, finish } = this.config.endpoints;
+        const { init } = this.config.endpoints;
+        let { upload, finish } = this.config.endpoints;
         this.abortController = new AbortController();
 
         const total = file.size;
@@ -105,7 +106,7 @@ export class ChunkedUploaderClient {
         try {
             const data = await initResponse.json();
             upload_id = data.upload_id;
-        } catch (error) {
+        } catch {
             this.reportProgress({ uploaded, total, state: UploadState.Error });
             throw new Error("Failed to parse upload_id");
         }
