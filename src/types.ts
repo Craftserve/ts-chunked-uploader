@@ -1,6 +1,6 @@
 export interface Endpoints {
-    upload: string;
-    finish: string;
+  upload: string;
+  finish: string;
 }
 
 /**
@@ -16,66 +16,66 @@ export interface Endpoints {
  *               files).
  */
 export interface FinishResponse {
-    hash: string;
-    length: number;
+  hash: string;
+  length: number;
 }
 
 export interface RequestInitOptions {
-    body?: {
-        [key: string]: any;
-    };
+  body?: {
+    [key: string]: any;
+  };
 }
 
 export interface ChunkRetryInfo {
-    chunkIndex: number;
-    attempt: number;
-    maxAttempts: number;
-    error: Error;
-    willRetryInMs: number;
+  chunkIndex: number;
+  attempt: number;
+  maxAttempts: number;
+  error: Error;
+  willRetryInMs: number;
 }
 
 export interface ChunkedUploaderClientProps {
-    endpoints: Endpoints;
-    /**
-     * Called after `finish` succeeds and the server hash has been verified.
-     * Receives the **std-base64** SHA-256 of the file (the same value that
-     * `upload()` returns and that the server reports in `FinishResponse.hash`).
-     * Not the base64url path identifier used in URLs.
-     */
-    onFinalize?: (sha256: string) => Promise<void>;
-    headers?: HeadersInit;
-    initOptions?: RequestInitOptions;
-    alg?: "SHA-256";
-    /**
-     * Maximum number of attempts per chunk on retryable errors.
-     * The first call counts as attempt 1, so a value of 10 means
-     * 1 initial attempt + 9 retries. Default: 10.
-     * Set to 1 to disable retries.
-     */
-    maxChunkRetries?: number;
-    /**
-     * Delay between chunk retry attempts, in milliseconds.
-     * The delay is cancellable via abort. Default: 10000 (10s).
-     */
-    chunkRetryDelayMs?: number;
-    /**
-     * Optional callback fired before each retry attempt — useful for
-     * surfacing "Retrying chunk N (attempt X/Y)" in the UI.
-     */
-    onChunkRetry?: (info: ChunkRetryInfo) => void;
+  endpoints: Endpoints;
+  /**
+   * Called after `finish` succeeds and the server hash has been verified.
+   * Receives the **std-base64** SHA-256 of the file (the same value that
+   * the server reports in `FinishResponse.hash`). This is **not** the
+   * base64url path identifier used in URLs or returned by `upload()`.
+   */
+  onFinalize?: (sha256: string) => Promise<void>;
+  headers?: HeadersInit;
+  initOptions?: RequestInitOptions;
+  alg?: "SHA-256";
+  /**
+   * Maximum number of attempts per chunk on retryable errors.
+   * The first call counts as attempt 1, so a value of 10 means
+   * 1 initial attempt + 9 retries. Default: 10.
+   * Set to 1 to disable retries.
+   */
+  maxChunkRetries?: number;
+  /**
+   * Delay between chunk retry attempts, in milliseconds.
+   * The delay is cancellable via abort. Default: 10000 (10s).
+   */
+  chunkRetryDelayMs?: number;
+  /**
+   * Optional callback fired before each retry attempt — useful for
+   * surfacing "Retrying chunk N (attempt X/Y)" in the UI.
+   */
+  onChunkRetry?: (info: ChunkRetryInfo) => void;
 }
 
 export enum UploadState {
-    Initializing = "initializing",
-    Uploading = "uploading",
-    Finishing = "finishing",
-    Error = "error",
-    Done = "done",
+  Initializing = "initializing",
+  Uploading = "uploading",
+  Finishing = "finishing",
+  Error = "error",
+  Done = "done",
 }
 
 export interface ProgressState {
-    uploaded: number;
-    total: number;
-    state: UploadState;
-    currentChunkSize?: number;
+  uploaded: number;
+  total: number;
+  state: UploadState;
+  currentChunkSize?: number;
 }

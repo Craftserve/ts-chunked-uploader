@@ -36,11 +36,12 @@ describe("UploaderClient", () => {
   // ---------- Single-chunk upload (chunkSize = -1) ----------
 
   describe("single-chunk upload (size = -1)", () => {
-    it("uploads, finalizes, and returns the server hash", async () => {
+    it("uploads, finalizes, and returns the base64url upload_id", async () => {
       const fetchStub = installFetchStub();
       const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
       const file = makeFile(bytes);
       const expectedHash = expectedHashForFile(bytes.length, bytes[0]);
+      const expectedUploadId = toBase64Url(expectedHash);
       fetchStub.queue.push(defaultFinishResponse(bytes.length, expectedHash));
 
       const onFinalize = vi.fn(async () => {});
@@ -68,7 +69,7 @@ describe("UploaderClient", () => {
       xhr.finishOK(200);
 
       const result = await promise;
-      expect(result).toBe(expectedHash);
+      expect(result).toBe(expectedUploadId);
 
       // finish was called, onFinalize was awaited.
       expect(fetchStub.calls.length).toBe(1);
@@ -252,7 +253,7 @@ describe("UploaderClient", () => {
       xhr.finishOK(200);
 
       const result = await p;
-      expect(result).toBe(h);
+      expect(result).toBe(toBase64Url(h));
       expect(states[states.length - 1].state).toBe(UploadState.Done);
       expect(states[states.length - 1].uploaded).toBe(0);
       expect(states[states.length - 1].total).toBe(0);
@@ -271,7 +272,7 @@ describe("UploaderClient", () => {
       const p = client.upload(file, -1);
       await MockXHR.waitForCount(1);
       MockXHR.last().finishOK(200);
-      await expect(p).resolves.toBe(h);
+      await expect(p).resolves.toBe(toBase64Url(h));
     });
 
     it("still rejects when the finish endpoint omits the length field", async () => {
@@ -365,7 +366,7 @@ describe("UploaderClient", () => {
       expect(info.error).toBeInstanceOf(Error);
 
       MockXHR.last().finishOK(200);
-      await expect(p).resolves.toBe(h);
+      await expect(p).resolves.toBe(toBase64Url(h));
     });
 
     it("retries on 5xx", async () => {
@@ -385,7 +386,7 @@ describe("UploaderClient", () => {
       MockXHR.last().finishError(502);
       await MockXHR.waitForCount(2, 1000);
       MockXHR.last().finishOK(200);
-      await expect(p).resolves.toBe(h);
+      await expect(p).resolves.toBe(toBase64Url(h));
     });
 
     it("does NOT retry on 4xx (non-retryable)", async () => {
@@ -504,7 +505,7 @@ describe("UploaderClient", () => {
       // and possibly the final chunk-complete onload should have been reported —
       // none of the small intermediate steps.
       const uploadingStates = states.filter(
-        (s) => s.state === UploadState.Uploading
+        (s) => s.state === UploadState.Uploading,
       );
       // Allow the "Uploading" kickoff (uploaded=0) and a final chunk-completion update.
       // We're checking that we did NOT get one notification per emitProgress call.
@@ -601,7 +602,7 @@ describe("UploaderClient", () => {
       const p = client.upload(file, -1);
       await MockXHR.waitForCount(1);
       MockXHR.last().finishOK(200);
-      await expect(p).resolves.toBe(h);
+      await expect(p).resolves.toBe(toBase64Url(h));
     });
 
     it("throws when the finish endpoint returns non-200", async () => {
@@ -622,7 +623,7 @@ describe("UploaderClient", () => {
   // ---------- onFinalize ----------
 
   describe("onFinalize", () => {
-    it("is awaited before resolving and receives the upload_id", async () => {
+    it("is awaited before resolving and receives the std-base64 hash", async () => {
       const fetchStub = installFetchStub();
       const bytes = new Uint8Array(4).fill(7);
       const file = makeFile(bytes);
@@ -762,9 +763,8 @@ describe("UploaderClient", () => {
       expect(new URL(xhrUrl).pathname).not.toMatch(/[+=]|%2B|%2F|%3D/i);
 
       MockXHR.last().finishOK(200);
-      // upload() resolves to the std-base64 hash (server-emitted, used for
-      // compare) — NOT the base64url path identifier.
-      await expect(p).resolves.toBe(stdBase64);
+      // upload() resolves to the base64url upload_id.
+      await expect(p).resolves.toBe(base64url);
 
       // Same guarantee on the finish endpoint URL.
       const finishUrl = fetchStub.calls[0].url;
@@ -780,61 +780,58 @@ describe("UploaderClient", () => {
     // which resets `lastReportedUploaded` to 0 — so the throttling state
     // does NOT leak between consecutive uploads in practice. This test
     // pins that observed behavior.
-    it(
-      "reports intermediate Uploading progress on a 2nd, smaller upload",
-      async () => {
-        const fetchStub = installFetchStub();
+    it("reports intermediate Uploading progress on a 2nd, smaller upload", async () => {
+      const fetchStub = installFetchStub();
 
-        // First upload: 50 bytes.
-        const big = new Uint8Array(50).fill(7);
-        const file1 = makeFile(big, "big.bin");
-        const h1 = expectedHashForFile(big.length, big[0]);
-        fetchStub.queue.push(defaultFinishResponse(big.length, h1));
+      // First upload: 50 bytes.
+      const big = new Uint8Array(50).fill(7);
+      const file1 = makeFile(big, "big.bin");
+      const h1 = expectedHashForFile(big.length, big[0]);
+      fetchStub.queue.push(defaultFinishResponse(big.length, h1));
 
-        const client = new UploaderClient({
-          endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
-          progressReportBytes: 5,
-          progressReportIntervalMs: 0,
-        } as any);
+      const client = new UploaderClient({
+        endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
+        progressReportBytes: 5,
+        progressReportIntervalMs: 0,
+      } as any);
 
-        // Drain the first upload.
-        const p1 = client.upload(file1, -1);
-        await MockXHR.waitForCount(1);
-        MockXHR.last().emitProgress(50);
-        MockXHR.last().finishOK(200);
-        await p1;
+      // Drain the first upload.
+      const p1 = client.upload(file1, -1);
+      await MockXHR.waitForCount(1);
+      MockXHR.last().emitProgress(50);
+      MockXHR.last().finishOK(200);
+      await p1;
 
-        // Second upload: 10 bytes (smaller than first).
-        const small = new Uint8Array(10).fill(3);
-        const file2 = makeFile(small, "small.bin");
-        const h2 = expectedHashForFile(small.length, small[0]);
-        fetchStub.queue.push(defaultFinishResponse(small.length, h2));
+      // Second upload: 10 bytes (smaller than first).
+      const small = new Uint8Array(10).fill(3);
+      const file2 = makeFile(small, "small.bin");
+      const h2 = expectedHashForFile(small.length, small[0]);
+      fetchStub.queue.push(defaultFinishResponse(small.length, h2));
 
-        const states: ProgressState[] = [];
-        client.onprogress((s) => states.push({ ...s }));
+      const states: ProgressState[] = [];
+      client.onprogress((s) => states.push({ ...s }));
 
-        const p2 = client.upload(file2, -1);
-        await MockXHR.waitForCount(2);
+      const p2 = client.upload(file2, -1);
+      await MockXHR.waitForCount(2);
 
-        // Emit intermediate progress for the second upload.
-        for (let i = 1; i <= 9; i++) {
-          MockXHR.last().emitProgress(i);
-        }
-        MockXHR.last().finishOK(200);
-        await p2;
-
-        // We expect at least one intermediate Uploading update where
-        // uploaded > 0 AND uploaded < total. With the bug, no such report
-        // exists because the throttle still thinks 50 bytes were reported.
-        const intermediate = states.filter(
-          (s) =>
-            s.state === UploadState.Uploading &&
-            s.uploaded > 0 &&
-            s.uploaded < small.length
-        );
-        expect(intermediate.length).toBeGreaterThan(0);
+      // Emit intermediate progress for the second upload.
+      for (let i = 1; i <= 9; i++) {
+        MockXHR.last().emitProgress(i);
       }
-    );
+      MockXHR.last().finishOK(200);
+      await p2;
+
+      // We expect at least one intermediate Uploading update where
+      // uploaded > 0 AND uploaded < total. With the bug, no such report
+      // exists because the throttle still thinks 50 bytes were reported.
+      const intermediate = states.filter(
+        (s) =>
+          s.state === UploadState.Uploading &&
+          s.uploaded > 0 &&
+          s.uploaded < small.length,
+      );
+      expect(intermediate.length).toBeGreaterThan(0);
+    });
   });
 
   // ---------- Hash computation errors ----------
@@ -851,7 +848,7 @@ describe("UploaderClient", () => {
       endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
     });
     await expect(client.upload(file, -1)).rejects.toThrow(
-      /Failed to calculate checksum/
+      /Failed to calculate checksum/,
     );
   });
 });
