@@ -114,6 +114,25 @@ export interface ChunkedUploaderClientProps {
    */
   responseTimeoutMs?: number;
   /**
+   * File size above which the checksum is computed incrementally instead of
+   * by reading the whole file into an ArrayBuffer. Default: 67108864 (64 MB).
+   *
+   * `crypto.subtle.digest` is one-shot, so hashing a multi-gigabyte upload
+   * the ordinary way allocates a buffer the size of the file. Below this
+   * threshold that is cheap and WebCrypto is the faster implementation;
+   * above it the streaming hasher keeps only `hashSliceBytes` resident.
+   *
+   * Both paths produce identical digests — the threshold is a
+   * memory/speed trade-off, never a correctness one. Set to `0` to always
+   * use WebCrypto.
+   */
+  hashStreamingThresholdBytes?: number;
+  /**
+   * How much of the file is read at a time while hashing incrementally.
+   * Default: 8388608 (8 MB). Values <= 0 fall back to the default.
+   */
+  hashSliceBytes?: number;
+  /**
    * Minimum gap between progress callbacks, in milliseconds. Default: 1000.
    *
    * Terminal and important states (`Initializing`, `Finishing`, `Done`,

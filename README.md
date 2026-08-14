@@ -143,6 +143,8 @@ callbacka zatrzymuje upload i jest propagowany jako `Failed to upload file: …`
 | `alg`                      | `string`                 | `sha-256` | Algorytm haszujący                                              |
 | `progressReportIntervalMs` | `number`                 | `1000`    | Minimalny odstęp czasu między raportami postępu (ms)            |
 | `progressReportBytes`      | `number`                 | `1000000` | Minimalna liczba bajtów między raportami postępu                |
+| `hashStreamingThresholdBytes` | `number`              | `67108864` | Powyżej tego rozmiaru suma kontrolna liczona strumieniowo; `0` = zawsze WebCrypto |
+| `hashSliceBytes`           | `number`                 | `8388608` | Ile pliku jest w pamięci naraz przy hashowaniu strumieniowym     |
 | `maxChunkRetries`          | `number`                 | `10`      | Liczba prób na chunk (pierwsza próba się liczy; `1` = bez retry)|
 | `maxFinishRetries`         | `number`                 | `3`       | Liczba prób wywołania `finish`                                  |
 | `chunkRetryDelayMs`        | `number`                 | `10000`   | Odstęp między próbami (anulowalny przez `abort`)                |
@@ -177,6 +179,35 @@ tego dwoma niezależnymi budżetami:
 Przekroczenie któregokolwiek budżetu jest raportowane jako `ChunkUploadError`
 z `kind: "timeout"` i `retryable: true` — czyli jako coś innego niż
 anulowanie przez użytkownika (`kind: "abort"`, `retryable: false`).
+
+---
+
+## 🔢 Suma kontrolna
+
+`crypto.subtle.digest` jest jednorazowe — potrzebuje całej wiadomości w
+pamięci naraz. Dla uploadu wielogigabajtowego oznacza to `file.arrayBuffer()`
+wielkości pliku, czyli OOM karty przeglądarki dokładnie na tych plikach,
+których użytkownik najmniej chce stracić (i mnożnik, gdy kiedyś ruszy
+równoległe wysyłanie kilku plików naraz).
+
+W WebCrypto nie ma strumieniowego digestu, więc klient ma dwie ścieżki:
+
+- **do `hashStreamingThresholdBytes`** — `crypto.subtle.digest` na całym
+  pliku. Stoi za tym BoringSSL i jest szybsze niż jakakolwiek implementacja
+  w JS, więc to domyślna droga;
+- **powyżej** — inkrementalny SHA-256 karmiony kawałkami po
+  `hashSliceBytes`, dzięki czemu rezydentny jest tylko jeden kawałek.
+
+**Obie ścieżki dają identyczny digest** — próg to kompromis
+pamięć/szybkość, nigdy poprawność. Pilnuje tego `sha256.test.ts`,
+porównując implementację inkrementalną z platformową na losowych wejściach,
+każdej granicy paddingu i każdym sposobie pocięcia wiadomości; a
+`UploaderClient.hashing.test.ts` sprawdza, że `upload_id` nie zależy od tego,
+która ścieżka się wykonała.
+
+Hashowanie wielogigabajtowego pliku trwa, więc pętla strumieniowa sprawdza
+`abort` między kawałkami — wcześniej anulowanie nie mogło się przebić, dopóki
+cały plik nie został wczytany.
 
 ---
 

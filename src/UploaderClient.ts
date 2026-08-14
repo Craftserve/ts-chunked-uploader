@@ -5,6 +5,7 @@ import {
   truncateDetail,
 } from "./errors";
 import { formatHashFromApi } from "./helpers/formatHash";
+import { Sha256 } from "./helpers/sha256";
 import {
   ChunkedUploaderClientProps,
   ChunkRetryInfo,
@@ -39,6 +40,26 @@ const DEFAULT_RESPONSE_TIMEOUT_MS = 300_000;
 
 /** `ChunkRetryInfo.chunkIndex` for retries that are not about a chunk. */
 const NOT_A_CHUNK = -1;
+
+/**
+ * Above this size the checksum is computed incrementally instead of by
+ * loading the whole file. Chosen so ordinary uploads keep the faster
+ * BoringSSL path while anything big enough to threaten the renderer's
+ * memory does not allocate a buffer its own size.
+ */
+const DEFAULT_HASH_STREAMING_THRESHOLD_BYTES = 64 * 1024 * 1024;
+
+/** How much of the file is resident at once while hashing incrementally. */
+const DEFAULT_HASH_SLICE_BYTES = 8 * 1024 * 1024;
+
+/** Raw digest bytes to the std-base64 the daemon compares against. */
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
 
 /**
  * Bind an outer abort signal and a timeout onto one controller.
@@ -137,6 +158,10 @@ export class UploaderClient {
   private stallTimeoutMs: number;
   private responseTimeoutMs: number;
 
+  // ---- hashing config ----
+  private hashStreamingThresholdBytes: number;
+  private hashSliceBytes: number;
+
   constructor(config: ChunkedUploaderClientProps) {
     this.config = config;
 
@@ -157,6 +182,15 @@ export class UploaderClient {
     this.stallTimeoutMs = config.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
     this.responseTimeoutMs =
       config.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
+
+    this.hashStreamingThresholdBytes =
+      config.hashStreamingThresholdBytes ??
+      DEFAULT_HASH_STREAMING_THRESHOLD_BYTES;
+    // A zero or negative slice would loop forever; clamp to the default.
+    this.hashSliceBytes =
+      config.hashSliceBytes && config.hashSliceBytes > 0
+        ? config.hashSliceBytes
+        : DEFAULT_HASH_SLICE_BYTES;
   }
 
   /**
@@ -369,24 +403,65 @@ export class UploaderClient {
   }
 
   /**
-   * Compute checksum of the whole file (base64 of raw digest bytes).
+   * Compute the file checksum (base64 of the raw digest bytes).
+   *
+   * Two paths, one result:
+   *
+   *  - **Whole-file** through `crypto.subtle.digest`, for anything at or
+   *    below `hashStreamingThresholdBytes`. It is backed by BoringSSL and
+   *    faster than any JS implementation, so it stays the default.
+   *  - **Streaming** through the incremental hasher above that threshold.
+   *    `file.arrayBuffer()` on a multi-gigabyte upload allocates a buffer
+   *    the size of the file — a renderer OOM on exactly the files users
+   *    least want to lose, and it would multiply once several uploads run
+   *    concurrently. Streaming keeps a single slice resident.
+   *
+   * `sha256.test.ts` pins the incremental hasher against WebCrypto over
+   * random inputs and every padding boundary, so which path runs cannot
+   * change the digest.
    */
-  private async computeHash(file: File, alg: string): Promise<string> {
+  private async computeHash(
+    file: File,
+    alg: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
     // Normalize algorithm for Web Crypto (e.g. 'sha-256' -> 'SHA-256').
     // Web Crypto expects identifiers like "SHA-256".
     const cryptoAlg = alg.toUpperCase();
 
     try {
-      const buffer = await file.arrayBuffer();
-      const digest = await crypto.subtle.digest(cryptoAlg, buffer);
-      const hashArray = Array.from(new Uint8Array(digest));
-      // convert to binary string then to base64
-      let binary = "";
-      for (let i = 0; i < hashArray.length; i++) {
-        binary += String.fromCharCode(hashArray[i]);
+      // The incremental hasher only implements SHA-256, so anything else
+      // takes the whole-file path regardless of size.
+      const canStream =
+        cryptoAlg === "SHA-256" &&
+        this.hashStreamingThresholdBytes > 0 &&
+        file.size > this.hashStreamingThresholdBytes;
+
+      if (!canStream) {
+        const buffer = await file.arrayBuffer();
+        const digest = await crypto.subtle.digest(cryptoAlg, buffer);
+        return bytesToBase64(new Uint8Array(digest));
       }
-      return btoa(binary);
+
+      const hasher = new Sha256();
+      for (let offset = 0; offset < file.size; offset += this.hashSliceBytes) {
+        // Hashing several GB takes real time. Without this an abort could
+        // not land until the whole file had been read.
+        if (this.aborted || signal?.aborted) {
+          throw new ChunkUploadError("Upload aborted", {
+            kind: "abort",
+            retryable: false,
+          });
+        }
+
+        const end = Math.min(offset + this.hashSliceBytes, file.size);
+        const slice = await file.slice(offset, end).arrayBuffer();
+        hasher.update(new Uint8Array(slice));
+      }
+
+      return bytesToBase64(hasher.digest());
     } catch (err) {
+      if (err instanceof ChunkUploadError) throw err;
       throw new ChunkUploadError("Failed to calculate checksum: " + err, {
         kind: "unknown",
         retryable: false,
@@ -791,7 +866,7 @@ export class UploaderClient {
     // compute file hash (base64)
     let sha256: string;
     try {
-      sha256 = await this.computeHash(file, alg);
+      sha256 = await this.computeHash(file, alg, signal);
     } catch (err) {
       this.reportProgress({ uploaded, total, state: UploadState.Error }, true);
       throw err;
