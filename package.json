@@ -1,6 +1,6 @@
 {
   "name": "@craftserve/ts-chunked-uploader",
-  "version": "1.1.0",
+  "version": "1.2.0-beta.0",
   "description": "TS client for chunked-uplaoder",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -9,13 +9,14 @@
   },
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
     "prepare": "husky && npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "eslint . --fix",
-    "verify": "npm run lint && npm test && npm run build"
+    "verify": "npm run lint && npm run typecheck && npm test && npm run build"
   },
   "keywords": [
     "craftserve",
