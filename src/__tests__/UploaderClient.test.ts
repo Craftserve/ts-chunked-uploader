@@ -605,11 +605,14 @@ describe("UploaderClient", () => {
       await expect(p).resolves.toBe(toBase64Url(h));
     });
 
-    it("throws when the finish endpoint returns non-200", async () => {
+    // 4xx on `finish` is permanent, so this also pins "no retry": the stub
+    // holds a single queued response and a second attempt would blow up on
+    // an empty queue. 5xx retries instead — see the "finish retries" block.
+    it("throws when the finish endpoint returns a non-retryable non-200", async () => {
       const fetchStub = installFetchStub();
       const bytes = new Uint8Array(4).fill(4);
       const file = makeFile(bytes);
-      fetchStub.queue.push({ status: 500, body: {} });
+      fetchStub.queue.push({ status: 400, body: {} });
       const client = new UploaderClient({
         endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
       });
@@ -617,6 +620,7 @@ describe("UploaderClient", () => {
       await MockXHR.waitForCount(1);
       MockXHR.last().finishOK(200);
       await expect(p).rejects.toThrow(/Failed to finish upload/);
+      expect(fetchStub.calls.length).toBe(1);
     });
   });
 

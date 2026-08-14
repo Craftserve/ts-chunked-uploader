@@ -1,15 +1,114 @@
+import {
+  ChunkUploadError,
+  isRetryableError,
+  isRetryableStatus,
+  truncateDetail,
+} from "./errors";
 import { formatHashFromApi } from "./helpers/formatHash";
 import {
   ChunkedUploaderClientProps,
   ChunkRetryInfo,
   FinishResponse,
   ProgressState,
+  RetryPhase,
   UploadState,
 } from "./types";
 
 const DEFAULT_HASH_ALG = "sha-256";
 const DEFAULT_MAX_CHUNK_RETRIES = 10;
 const DEFAULT_CHUNK_RETRY_DELAY_MS = 10_000;
+
+/**
+ * `finish` is a cheap, idempotent GET — worth retrying, but not with the
+ * chunk budget. Re-sending 25 MiB deserves ten attempts; re-asking the
+ * daemon for a hash does not.
+ */
+const DEFAULT_MAX_FINISH_RETRIES = 3;
+
+/**
+ * No bytes moved for this long → the connection is presumed dead.
+ * Re-armed on every progress tick, so it is independent of bandwidth.
+ */
+const DEFAULT_STALL_TIMEOUT_MS = 60_000;
+
+/**
+ * Budget for the server's answer once the body has been handed over.
+ * Deliberately generous — see `responseTimeoutMs` in `types.ts`.
+ */
+const DEFAULT_RESPONSE_TIMEOUT_MS = 300_000;
+
+/** `ChunkRetryInfo.chunkIndex` for retries that are not about a chunk. */
+const NOT_A_CHUNK = -1;
+
+/**
+ * Bind an outer abort signal and a timeout onto one controller.
+ *
+ * `AbortSignal.any` would do this in one line but is too new to rely on
+ * here (and is missing from parts of the test environment), so the linkage
+ * is done by hand. `timedOut` lets the caller tell "the deadline passed"
+ * apart from "the caller cancelled" — they map to opposite retry verdicts.
+ */
+function linkAbortWithTimeout(
+  source: AbortSignal | undefined,
+  timeoutMs: number,
+) {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const onSourceAbort = () => controller.abort();
+
+  if (source) {
+    if (source.aborted) {
+      controller.abort();
+    } else {
+      source.addEventListener("abort", onSourceAbort, { once: true });
+    }
+  }
+
+  if (timeoutMs > 0) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  }
+
+  return {
+    signal: controller.signal,
+    get timedOut() {
+      return timedOut;
+    },
+    dispose() {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (source) {
+        try {
+          source.removeEventListener("abort", onSourceAbort);
+        } catch {
+          /* listener already gone */
+        }
+      }
+    },
+  };
+}
+
+/**
+ * Read a response body as text without ever throwing.
+ *
+ * Used only to enrich an error with the daemon's own message. Response-like
+ * stubs in tests may not implement `text()`, and a body that fails to read
+ * must never replace the real failure with a secondary one.
+ */
+async function safeReadText(response: Response): Promise<string | undefined> {
+  try {
+    if (typeof response.text !== "function") return undefined;
+    return await response.text();
+  } catch {
+    return undefined;
+  }
+}
 
 export class UploaderClient {
   private config: ChunkedUploaderClientProps;
@@ -23,49 +122,67 @@ export class UploaderClient {
     state: UploadState.Initializing,
   };
 
-  // ---- new fields for throttling ----
+  // ---- progress throttling ----
   private lastProgressReportTime: number = 0;
   private lastReportedUploaded: number = 0;
   private progressIntervalMs: number;
   private progressBytesThreshold: number;
-  // ------------------------------------
 
-  // ---- chunk retry config ----
+  // ---- retry config ----
   private maxChunkRetries: number;
+  private maxFinishRetries: number;
   private chunkRetryDelayMs: number;
-  // ----------------------------
+
+  // ---- timeout config ----
+  private stallTimeoutMs: number;
+  private responseTimeoutMs: number;
 
   constructor(config: ChunkedUploaderClientProps) {
     this.config = config;
 
-    // Allow optional overrides in config (no type change required at types file):
-    const cfgAny = this.config as any;
-    this.progressIntervalMs = cfgAny.progressReportIntervalMs ?? 1000; // default 1s
-    this.progressBytesThreshold = cfgAny.progressReportBytes ?? 1_000_000; // default 1MB
+    this.progressIntervalMs = config.progressReportIntervalMs ?? 1000;
+    this.progressBytesThreshold = config.progressReportBytes ?? 1_000_000;
 
     this.maxChunkRetries = Math.max(
       1,
       config.maxChunkRetries ?? DEFAULT_MAX_CHUNK_RETRIES,
     );
+    this.maxFinishRetries = Math.max(
+      1,
+      config.maxFinishRetries ?? DEFAULT_MAX_FINISH_RETRIES,
+    );
     this.chunkRetryDelayMs =
       config.chunkRetryDelayMs ?? DEFAULT_CHUNK_RETRY_DELAY_MS;
+
+    this.stallTimeoutMs = config.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+    this.responseTimeoutMs =
+      config.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
   }
 
   /**
    * Sleep for `ms` milliseconds. Resolves when the timer fires; rejects with
-   * "Upload aborted" if the abort signal fires first. Used between chunk
-   * retry attempts so a user-initiated cancel does not have to wait out the
-   * remaining backoff window.
+   * a non-retryable abort error if the abort signal fires first, so a
+   * user-initiated cancel does not have to wait out the remaining backoff.
    */
   private delayWithAbort(ms: number, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
       if (signal.aborted) {
-        reject(new Error("Upload aborted"));
+        reject(
+          new ChunkUploadError("Upload aborted", {
+            kind: "abort",
+            retryable: false,
+          }),
+        );
         return;
       }
       const onAbort = () => {
         clearTimeout(timer);
-        reject(new Error("Upload aborted"));
+        reject(
+          new ChunkUploadError("Upload aborted", {
+            kind: "abort",
+            retryable: false,
+          }),
+        );
       };
       const timer = setTimeout(() => {
         signal.removeEventListener("abort", onAbort);
@@ -73,30 +190,6 @@ export class UploaderClient {
       }, ms);
       signal.addEventListener("abort", onAbort, { once: true });
     });
-  }
-
-  /**
-   * Decide whether a chunk-upload error is worth retrying.
-   *  - Network errors → yes (transient connectivity issue)
-   *  - HTTP 5xx       → yes (server hiccup)
-   *  - HTTP 4xx       → no  (client-side problem, retrying won't help)
-   *  - Aborts         → no  (user/system explicitly stopped us)
-   */
-  private isRetryableChunkError(err: unknown): boolean {
-    const msg = err instanceof Error ? err.message : String(err ?? "");
-
-    if (/aborted/i.test(msg)) return false;
-
-    if (/Network error during upload/i.test(msg)) return true;
-
-    const m = /Chunk upload failed with status (\d+)/.exec(msg);
-    if (m) {
-      const status = Number(m[1]);
-      return status >= 500 && status < 600;
-    }
-
-    // Unknown errors (e.g. xhr.send threw): treat as transient and retry.
-    return true;
   }
 
   onprogress(cb: (state: ProgressState) => void): () => void {
@@ -176,6 +269,105 @@ export class UploaderClient {
     );
   }
 
+  private notifyRetry(info: {
+    chunkIndex: number;
+    phase: RetryPhase;
+    attempt: number;
+    maxAttempts: number;
+    error: unknown;
+  }) {
+    if (!this.config.onChunkRetry) return;
+
+    const payload: ChunkRetryInfo = {
+      chunkIndex: info.chunkIndex,
+      phase: info.phase,
+      attempt: info.attempt,
+      maxAttempts: info.maxAttempts,
+      error:
+        info.error instanceof Error
+          ? info.error
+          : new Error(String(info.error)),
+      willRetryInMs: this.chunkRetryDelayMs,
+    };
+
+    try {
+      this.config.onChunkRetry(payload);
+    } catch (cbErr) {
+      console.error("onChunkRetry callback error:", cbErr);
+    }
+  }
+
+  /**
+   * Run `attempt` until it succeeds, the error is judged permanent, the
+   * budget runs out, or the upload is aborted.
+   *
+   * Shared by the chunk loop and the `finish` call so both obey the same
+   * abort semantics. Retryability comes off the typed error — never off the
+   * message text.
+   */
+  private async runWithRetries<T>(
+    attempt: (attemptNumber: number) => Promise<T>,
+    opts: {
+      signal: AbortSignal;
+      maxAttempts: number;
+      chunkIndex: number;
+      phase: RetryPhase;
+    },
+  ): Promise<T> {
+    const { signal, maxAttempts, chunkIndex, phase } = opts;
+    let lastError: unknown = null;
+
+    for (let n = 1; n <= maxAttempts; n++) {
+      if (this.aborted || signal.aborted) {
+        throw new ChunkUploadError("Upload aborted", {
+          kind: "abort",
+          retryable: false,
+        });
+      }
+
+      try {
+        return await attempt(n);
+      } catch (err) {
+        lastError = err;
+
+        // Stop immediately on abort or non-retryable errors.
+        if (this.aborted || signal.aborted || !isRetryableError(err)) break;
+
+        // Out of attempts → give up and propagate the last failure.
+        if (n >= maxAttempts) break;
+
+        this.notifyRetry({
+          chunkIndex,
+          phase,
+          attempt: n,
+          maxAttempts,
+          error: err,
+        });
+
+        // Wait the configured backoff before the next attempt. If abort
+        // fires during the wait, propagate that abort instead of the
+        // underlying failure.
+        try {
+          await this.delayWithAbort(this.chunkRetryDelayMs, signal);
+        } catch (abortErr) {
+          lastError = abortErr;
+          break;
+        }
+      }
+    }
+
+    // `maxAttempts` is clamped to >= 1 in the constructor, so the loop
+    // always ran at least once and `lastError` is set. The fallback exists
+    // so a future caller passing 0 gets a real error rather than `throw null`.
+    throw (
+      lastError ??
+      new ChunkUploadError("Upload failed with no attempts made", {
+        kind: "unknown",
+        retryable: false,
+      })
+    );
+  }
+
   /**
    * Compute checksum of the whole file (base64 of raw digest bytes).
    */
@@ -195,12 +387,29 @@ export class UploaderClient {
       }
       return btoa(binary);
     } catch (err) {
-      throw new Error("Failed to calculate checksum: " + err);
+      throw new ChunkUploadError("Failed to calculate checksum: " + err, {
+        kind: "unknown",
+        retryable: false,
+        cause: err,
+      });
     }
   }
 
   /**
    * Upload a single chunk using XHR to preserve upload progress events.
+   *
+   * Two independent watchdogs guard the request, because XHR on its own
+   * will wait forever on a half-open connection:
+   *
+   *  - **stall** — armed before `send()` and re-armed whenever more bytes
+   *    go out. It fires only when *nothing* moves, so a slow-but-alive
+   *    link keeps resetting it and is never killed.
+   *  - **response** — armed once the body has been handed to the transport
+   *    (`upload.loadend`). From there we are waiting on the server, and no
+   *    further progress events are coming to prove liveness.
+   *
+   * A watchdog abort is reported as a retryable `timeout`, which is what
+   * separates it from a caller-initiated `abort` (permanent).
    */
   private uploadChunk(
     uploadUrl: string,
@@ -213,11 +422,49 @@ export class UploaderClient {
     signal?: AbortSignal,
   ): Promise<void> {
     return new Promise((resolve, reject) => {
-      console.log("Starting upload of chunk", i, "to", uploadUrl);
       const xhr = new XMLHttpRequest();
-      let listenerAdded = false;
 
-      const onAbort = () => {
+      let settled = false;
+      let listenerAdded = false;
+      let timedOutPhase: "stall" | "response" | null = null;
+      let watchdog: ReturnType<typeof setTimeout> | null = null;
+      let lastLoaded = 0;
+
+      const uploadedSoFar = () =>
+        Math.min(
+          total,
+          progressPerChunk.reduce((a, b) => a + b, 0),
+        );
+
+      const clearWatchdog = () => {
+        if (watchdog !== null) {
+          clearTimeout(watchdog);
+          watchdog = null;
+        }
+      };
+
+      const armWatchdog = (ms: number, phase: "stall" | "response") => {
+        clearWatchdog();
+        if (!ms || ms <= 0) return;
+        watchdog = setTimeout(() => {
+          watchdog = null;
+          timedOutPhase = phase;
+          try {
+            xhr.abort();
+          } catch {
+            // `onabort` may not fire if the request already finished;
+            // settle explicitly so the promise can never dangle.
+            fail(
+              new ChunkUploadError(`Chunk upload timed out (${phase})`, {
+                kind: "timeout",
+                retryable: true,
+              }),
+            );
+          }
+        }, ms);
+      };
+
+      const onAbortSignal = () => {
         try {
           xhr.abort();
         } catch {
@@ -225,17 +472,50 @@ export class UploaderClient {
         }
       };
 
+      const cleanup = () => {
+        clearWatchdog();
+        if (signal && listenerAdded) {
+          try {
+            signal.removeEventListener("abort", onAbortSignal);
+          } catch {
+            /* listener already gone */
+          }
+        }
+      };
+
+      const fail = (err: ChunkUploadError) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        this.reportProgress(
+          {
+            uploaded: progressPerChunk.reduce((a, b) => a + b, 0),
+            total,
+            state: UploadState.Error,
+          },
+          true,
+        );
+        reject(err);
+      };
+
+      const succeed = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+
       if (signal) {
-        signal.addEventListener("abort", onAbort, { once: true });
+        signal.addEventListener("abort", onAbortSignal, { once: true });
         listenerAdded = true;
       }
 
       xhr.open("PUT", uploadUrl, true);
 
       // credentials handling - preserve previous behaviour
-      const cfgAny = this.config as any;
-      const maybeCredentials = (cfgAny.headers &&
-        (cfgAny.headers as any).credentials) as string | undefined;
+      const maybeCredentials = (
+        this.config.headers as Record<string, string> | undefined
+      )?.credentials;
       if (maybeCredentials && maybeCredentials === "include") {
         xhr.withCredentials = true;
       }
@@ -246,7 +526,9 @@ export class UploaderClient {
         if (lower === "content-type" || lower === "credentials") continue;
         try {
           xhr.setRequestHeader(k, v);
-        } catch {}
+        } catch {
+          /* header rejected by the agent — not worth failing the upload */
+        }
       }
 
       xhr.upload.onprogress = (ev) => {
@@ -254,171 +536,222 @@ export class UploaderClient {
         const reportedLoaded = typeof ev.loaded === "number" ? ev.loaded : 0;
         const loaded = Math.min(chunkLength, reportedLoaded);
 
+        // Only *forward* movement counts as liveness. A repeat event at the
+        // same offset must not keep a dead connection alive.
+        if (loaded > lastLoaded) {
+          lastLoaded = loaded;
+          armWatchdog(this.stallTimeoutMs, "stall");
+        }
+
         // Do not decrease previously recorded progress for this chunk (prevents regressions / double-counting issues)
         progressPerChunk[i] = Math.max(progressPerChunk[i] || 0, loaded);
 
-        const uploaded = Math.min(
-          total,
-          progressPerChunk.reduce((a, b) => a + b, 0),
-        );
-
         this.reportProgress({
-          uploaded,
+          uploaded: uploadedSoFar(),
           total,
           state: UploadState.Uploading,
           currentChunkSize: chunkLength,
         });
       };
 
-      xhr.onload = () => {
-        // remove listener if still present
-        if (signal && listenerAdded) {
-          try {
-            signal.removeEventListener("abort", onAbort);
-          } catch {}
-        }
+      // Body fully handed to the transport: no more progress events are
+      // coming, so switch from the stall budget to the response budget.
+      xhr.upload.onloadend = () => {
+        if (settled) return;
+        armWatchdog(this.responseTimeoutMs, "response");
+      };
 
+      xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
           // ensure chunk considered fully uploaded
           progressPerChunk[i] = chunkLength;
-          const uploaded = Math.min(
-            total,
-            progressPerChunk.reduce((a, b) => a + b, 0),
-          );
 
           this.reportProgress({
-            uploaded,
+            uploaded: uploadedSoFar(),
             total,
             state: UploadState.Uploading,
             currentChunkSize: chunkLength,
           });
 
-          resolve();
-        } else {
-          this.reportProgress(
-            {
-              uploaded: progressPerChunk.reduce((a, b) => a + b, 0),
-              total,
-              state: UploadState.Error,
-            },
-            true,
-          );
-          reject(new Error(`Chunk upload failed with status ${xhr.status}`));
+          succeed();
+          return;
         }
+
+        const detail = truncateDetail(xhr.responseText);
+        fail(
+          new ChunkUploadError(
+            `Chunk upload failed with status ${xhr.status}` +
+              (detail ? `: ${detail}` : ""),
+            {
+              kind: "http",
+              status: xhr.status,
+              retryable: isRetryableStatus(xhr.status),
+              detail,
+            },
+          ),
+        );
       };
 
       xhr.onerror = () => {
-        if (signal && listenerAdded) {
-          try {
-            signal.removeEventListener("abort", onAbort);
-          } catch {}
-        }
-        this.reportProgress(
-          {
-            uploaded: progressPerChunk.reduce((a, b) => a + b, 0),
-            total,
-            state: UploadState.Error,
-          },
-          true,
+        fail(
+          new ChunkUploadError("Network error during upload", {
+            kind: "network",
+            retryable: true,
+          }),
         );
-        reject(new Error("Network error during upload"));
       };
 
       xhr.onabort = () => {
-        if (signal && listenerAdded) {
-          try {
-            signal.removeEventListener("abort", onAbort);
-          } catch {}
+        if (timedOutPhase) {
+          fail(
+            new ChunkUploadError(
+              `Chunk upload timed out (${timedOutPhase})`,
+              { kind: "timeout", retryable: true },
+            ),
+          );
+          return;
         }
-        this.reportProgress(
-          {
-            uploaded: progressPerChunk.reduce((a, b) => a + b, 0),
-            total,
-            state: UploadState.Error,
-          },
-          true,
+        fail(
+          new ChunkUploadError("Upload aborted", {
+            kind: "abort",
+            retryable: false,
+          }),
         );
-        reject(new Error("Upload aborted"));
       };
 
       try {
         xhr.setRequestHeader(
           "Content-type",
           // keep previous behaviour (fallback to octet-stream)
-          (this.config.headers as Record<string, string>)["Content-type"] ||
+          (this.config.headers as Record<string, string> | undefined)?.[
+            "Content-type"
+          ] ||
             (chunk instanceof File
               ? chunk.type || "application/octet-stream"
               : "application/octet-stream") ||
-            (this.config.headers &&
-              (this.config.headers as any)["content-type"]) ||
-            (chunk instanceof Blob && (chunk as Blob).type) ||
+            (this.config.headers as Record<string, string> | undefined)?.[
+              "content-type"
+            ] ||
+            (chunk instanceof Blob && chunk.type) ||
             "application/octet-stream",
         );
-      } catch {}
+      } catch {
+        /* agent refused the header — the daemon defaults to octet-stream */
+      }
 
       try {
+        // Arm the stall budget before handing the body over, so a request
+        // that never starts moving is caught too.
+        armWatchdog(this.stallTimeoutMs, "stall");
         xhr.send(chunk);
       } catch (err) {
-        if (signal && listenerAdded) {
-          try {
-            signal.removeEventListener("abort", onAbort);
-          } catch {}
-        }
-        this.reportProgress(
-          {
-            uploaded: progressPerChunk.reduce((a, b) => a + b, 0),
-            total,
-            state: UploadState.Error,
-          },
-          true,
+        fail(
+          new ChunkUploadError(
+            `Failed to send chunk: ${err instanceof Error ? err.message : String(err)}`,
+            { kind: "unknown", retryable: true, cause: err },
+          ),
         );
-        reject(err);
       }
     });
   }
 
   /**
-   * Finish endpoint fetch and verify server-side hash/length
+   * Finish endpoint fetch and verify server-side hash/length.
+   *
+   * Retryability is per failure mode, not per call: transport failures and
+   * 5xx are transient, but a checksum or length mismatch is a deterministic
+   * statement about the bytes on disk. Retrying those would only delay a
+   * real corruption report.
    */
   private async finishAndVerify(
     finishUrl: string,
     sha256: string,
     total: number,
     alg: string,
+    signal?: AbortSignal,
   ): Promise<string> {
-    const response = await fetch(finishUrl, {
-      method: "GET",
-      headers: this.config.headers,
-      signal: this.abortController?.signal,
-    });
+    const link = linkAbortWithTimeout(signal, this.responseTimeoutMs);
 
-    if (response.status !== 200) {
-      this.reportProgress(
-        { uploaded: total, total, state: UploadState.Error },
-        true,
+    let data: Partial<FinishResponse>;
+    try {
+      const response = await fetch(finishUrl, {
+        method: "GET",
+        headers: this.config.headers,
+        signal: link.signal,
+      });
+
+      if (response.status !== 200) {
+        const detail = truncateDetail(await safeReadText(response));
+        throw new ChunkUploadError(
+          `Failed to finish upload (HTTP ${response.status})` +
+            (detail ? `: ${detail}` : ""),
+          {
+            kind: "http",
+            status: response.status,
+            retryable: isRetryableStatus(response.status),
+            detail,
+          },
+        );
+      }
+
+      try {
+        data = (await response.json()) as Partial<FinishResponse>;
+      } catch (err) {
+        // A body that will not parse is usually a truncated response, which
+        // another attempt can fix.
+        throw new ChunkUploadError(
+          "Failed to finish upload: malformed response body",
+          { kind: "network", retryable: true, cause: err },
+        );
+      }
+    } catch (err) {
+      if (err instanceof ChunkUploadError) throw err;
+
+      if (link.timedOut) {
+        throw new ChunkUploadError("Failed to finish upload: timed out", {
+          kind: "timeout",
+          retryable: true,
+          cause: err,
+        });
+      }
+
+      if (this.aborted || signal?.aborted) {
+        throw new ChunkUploadError("Upload aborted", {
+          kind: "abort",
+          retryable: false,
+          cause: err,
+        });
+      }
+
+      throw new ChunkUploadError(
+        `Failed to finish upload: ${err instanceof Error ? err.message : String(err)}`,
+        { kind: "network", retryable: true, cause: err },
       );
-      throw new Error(
-        "Failed to finish upload. Checksum mismatch or server error.",
-      );
+    } finally {
+      link.dispose();
     }
 
-    const data = (await response.json()) as Partial<FinishResponse>;
-
     if (typeof data.hash !== "string" || typeof data.length !== "number") {
-      throw new Error("No hash returned from server");
+      throw new ChunkUploadError("No hash returned from server", {
+        kind: "http",
+        status: 200,
+        retryable: false,
+      });
     }
 
     const serverHash = formatHashFromApi(data.hash, alg);
 
     if (data.length !== total) {
-      throw new Error(
+      throw new ChunkUploadError(
         `Uploaded length mismatch after upload. Expected ${total}, got ${data.length}`,
+        { kind: "http", status: 200, retryable: false },
       );
     }
 
     if (serverHash !== sha256) {
-      throw new Error(
+      throw new ChunkUploadError(
         `Checksum mismatch after upload. Expected ${sha256}, got ${serverHash}`,
+        { kind: "http", status: 200, retryable: false },
       );
     }
 
@@ -516,84 +849,32 @@ export class UploaderClient {
         headers["Range"] = `bytes=${start}-${end - 1}`;
       }
 
-      // ---- per-chunk retry loop ----
-      // Wraps the single uploadChunk() call. The first call counts as
-      // attempt 1; transient failures (network errors, 5xx) are retried
-      // up to `maxChunkRetries` total attempts with `chunkRetryDelayMs`
-      // between attempts. The delay is cancellable via abort.
-      let chunkErr: unknown = null;
+      try {
+        await this.runWithRetries(
+          async () => {
+            // Reset partial progress for this chunk before (re)trying so
+            // a previously-aborted chunk does not double-count its bytes.
+            progressPerChunk[i] = 0;
 
-      for (let attempt = 1; attempt <= this.maxChunkRetries; attempt++) {
-        if (this.aborted || signal.aborted) {
-          chunkErr = new Error("Upload aborted");
-          break;
-        }
-
-        try {
-          // Reset partial progress for this chunk before (re)trying so
-          // a previously-aborted chunk does not double-count its bytes.
-          progressPerChunk[i] = 0;
-
-          await this.uploadChunk(
-            upload,
-            chunk,
-            headers,
-            i,
-            chunkLength,
-            progressPerChunk,
-            total,
+            await this.uploadChunk(
+              upload,
+              chunk,
+              headers,
+              i,
+              chunkLength,
+              progressPerChunk,
+              total,
+              signal,
+            );
+          },
+          {
             signal,
-          );
-
-          chunkErr = null;
-          break; // chunk uploaded successfully
-        } catch (err) {
-          chunkErr = err;
-
-          // Stop immediately on abort or non-retryable errors.
-          if (
-            this.aborted ||
-            signal.aborted ||
-            !this.isRetryableChunkError(err)
-          ) {
-            break;
-          }
-
-          // Out of attempts → give up and propagate.
-          if (attempt >= this.maxChunkRetries) {
-            break;
-          }
-
-          // Surface the retry to the caller (UI feedback hook).
-          if (this.config.onChunkRetry) {
-            const info: ChunkRetryInfo = {
-              chunkIndex: i,
-              attempt,
-              maxAttempts: this.maxChunkRetries,
-              error: err instanceof Error ? err : new Error(String(err)),
-              willRetryInMs: this.chunkRetryDelayMs,
-            };
-            try {
-              this.config.onChunkRetry(info);
-            } catch (cbErr) {
-              console.error("onChunkRetry callback error:", cbErr);
-            }
-          }
-
-          // Wait the configured backoff before the next attempt.
-          // If abort fires during the wait, propagate that abort
-          // instead of the underlying chunk error.
-          try {
-            await this.delayWithAbort(this.chunkRetryDelayMs, signal);
-          } catch (abortErr) {
-            chunkErr = abortErr;
-            break;
-          }
-        }
-      }
-
-      if (chunkErr) {
-        // ensure we report and cleanup
+            maxAttempts: this.maxChunkRetries,
+            chunkIndex: i,
+            phase: "chunk",
+          },
+        );
+      } catch (chunkErr) {
         this.reportProgress(
           {
             uploaded: progressPerChunk.reduce((a, b) => a + b, 0),
@@ -602,7 +883,6 @@ export class UploaderClient {
           },
           true,
         );
-        // propagate error
         throw chunkErr;
       }
     }
@@ -616,7 +896,10 @@ export class UploaderClient {
         },
         true,
       );
-      throw new Error("Upload aborted during chunk upload");
+      throw new ChunkUploadError("Upload aborted during chunk upload", {
+        kind: "abort",
+        retryable: false,
+      });
     }
 
     try {
@@ -627,11 +910,24 @@ export class UploaderClient {
         true,
       );
 
-      // finishAndVerify will throw on mismatch
-      await this.finishAndVerify(finish, sha256, total, alg);
+      // finishAndVerify throws on mismatch; only transient failures retry.
+      await this.runWithRetries(
+        () => this.finishAndVerify(finish, sha256, total, alg, signal),
+        {
+          signal,
+          maxAttempts: this.maxFinishRetries,
+          chunkIndex: NOT_A_CHUNK,
+          phase: "finish",
+        },
+      );
 
       if (this.config.onFinalize) {
         // Pass the std-base64 SHA-256 (not the base64url path identifier).
+        //
+        // Deliberately NOT retried: the panel's finalize moves the staged
+        // upload to its destination, which is not idempotent. A retry after
+        // a move that actually succeeded but whose response was lost would
+        // report a spurious failure for a file that landed correctly.
         await this.config.onFinalize(sha256);
       }
 
@@ -644,11 +940,16 @@ export class UploaderClient {
         true,
       );
     } catch (err) {
-      this.reportProgress(
-        { uploaded: uploaded, total, state: UploadState.Error },
-        true,
+      this.reportProgress({ uploaded, total, state: UploadState.Error }, true);
+
+      // Preserve the typed failure so callers keep the status and the retry
+      // verdict. Only untyped throws (e.g. from a consumer's onFinalize) get
+      // wrapped, and their message is carried through verbatim.
+      if (err instanceof ChunkUploadError) throw err;
+      throw new ChunkUploadError(
+        `Failed to upload file: ${err instanceof Error ? err.message : String(err)}`,
+        { kind: "unknown", retryable: false, cause: err },
       );
-      throw new Error("Failed to upload file: " + err);
     }
 
     return uploadId;

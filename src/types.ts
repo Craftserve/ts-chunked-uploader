@@ -26,12 +26,24 @@ export interface RequestInitOptions {
   };
 }
 
+/**
+ * Which stage of an upload a retry belongs to. `"chunk"` re-sends bytes;
+ * `"finish"` re-asks the server to verify what it stored.
+ */
+export type RetryPhase = "chunk" | "finish";
+
 export interface ChunkRetryInfo {
+  /** Zero-based chunk index, or `-1` when `phase` is not `"chunk"`. */
   chunkIndex: number;
   attempt: number;
   maxAttempts: number;
   error: Error;
   willRetryInMs: number;
+  /**
+   * Optional for backward compatibility with consumers written before the
+   * `finish` phase could retry. Absent means `"chunk"`.
+   */
+  phase?: RetryPhase;
 }
 
 export interface ChunkedUploaderClientProps {
@@ -54,7 +66,17 @@ export interface ChunkedUploaderClientProps {
    */
   maxChunkRetries?: number;
   /**
-   * Delay between chunk retry attempts, in milliseconds.
+   * Maximum number of attempts for the `finish` verification call.
+   * Default: 3.
+   *
+   * Lower than `maxChunkRetries` on purpose — re-sending a 25 MiB chunk is
+   * expensive and worth ten tries, re-asking the daemon for a hash is not.
+   * Only transient failures (5xx, network, timeout) consume an attempt; a
+   * checksum or length mismatch is deterministic and fails immediately.
+   */
+  maxFinishRetries?: number;
+  /**
+   * Delay between retry attempts, in milliseconds.
    * The delay is cancellable via abort. Default: 10000 (10s).
    */
   chunkRetryDelayMs?: number;
@@ -63,6 +85,47 @@ export interface ChunkedUploaderClientProps {
    * surfacing "Retrying chunk N (attempt X/Y)" in the UI.
    */
   onChunkRetry?: (info: ChunkRetryInfo) => void;
+  /**
+   * How long a chunk may make **no upload progress at all** before the
+   * attempt is aborted and retried, in milliseconds. Default: 60000 (60s).
+   *
+   * This is deliberately a *stall* budget, not a wall-clock deadline: the
+   * timer is re-armed on every `upload.onprogress` tick, so it is
+   * independent of the connection's bandwidth. A 25 MiB chunk crawling
+   * over a 1 Mbit/s link keeps resetting it and is never killed; a
+   * half-open connection where nothing moves is caught.
+   *
+   * Set to `0` to disable.
+   */
+  stallTimeoutMs?: number;
+  /**
+   * How long to wait for the server's response **after** the request body
+   * has been fully handed to the transport, in milliseconds.
+   * Default: 300000 (5 min).
+   *
+   * Generous on purpose. `upload.onprogress` reports bytes written to the
+   * socket buffer, not bytes acknowledged by the server, so a small chunk
+   * can report 100% while still in flight — a tight budget here would abort
+   * healthy uploads on slow links. The point is to bound a connection that
+   * will *never* answer, not to enforce a latency SLO. Tighten only with
+   * telemetry in hand.
+   *
+   * Set to `0` to disable.
+   */
+  responseTimeoutMs?: number;
+  /**
+   * Minimum gap between progress callbacks, in milliseconds. Default: 1000.
+   *
+   * Terminal and important states (`Initializing`, `Finishing`, `Done`,
+   * `Error`) always report immediately and ignore this.
+   */
+  progressReportIntervalMs?: number;
+  /**
+   * Report progress early when at least this many bytes have moved since
+   * the last callback, regardless of `progressReportIntervalMs`.
+   * Default: 1000000 (1 MB).
+   */
+  progressReportBytes?: number;
 }
 
 export enum UploadState {
