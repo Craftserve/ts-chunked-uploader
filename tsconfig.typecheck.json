@@ -1,0 +1,14 @@
+{
+    // Type-checks everything, including the tests that `tsconfig.json`
+    // deliberately keeps out of the build so they do not ship to consumers.
+    // Emits nothing — `npm run build` owns the artifact.
+    "extends": "./tsconfig.json",
+    // `declaration` stays inherited: turning it off here would orphan the
+    // inherited `declarationDir` and TS refuses that combination. `noEmit`
+    // suppresses all output anyway.
+    "compilerOptions": {
+        "noEmit": true
+    },
+    "include": ["src/**/*"],
+    "exclude": ["node_modules", "dist"]
+}

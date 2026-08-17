@@ -17,5 +17,9 @@
     "out": "docs"
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  // The build feeds `files: ["/dist"]`, so anything emitted here ships to
+  // every consumer. Tests were emitted alongside the library and made up
+  // more than half the published tarball. They are still type-checked —
+  // `npm run typecheck` compiles them via `tsconfig.typecheck.json`.
+  "exclude": ["node_modules", "dist", "src/__tests__"]
 }

@@ -77,8 +77,13 @@ Biblioteka nie definiuje endpointów ani ich nie tworzy — jedynie wywołuje dw
   `{upload_id}` to **base64url** (RFC 4648 §5, bez padding `=`) ze skrótu
   SHA‑256 całego pliku — to jest tylko identyfikator dla URL‑a, nie wartość
   do porównywania (patrz `finish` poniżej).
-  W przypadku pierwszego chunka (gdy `overwrite=false`) klient dodaje
-  query `?create=1`.
+  Gdy `overwrite=false` klient dokleja query `?create=1` — **do każdego
+  chunka, nie tylko do pierwszego**. URL jest budowany raz, przed pętlą po
+  chunkach, więc backend musi traktować `create=1` idempotentnie
+  („utwórz, jeśli nie istnieje"). Gdyby wymuszał odrzucenie przy istniejącym
+  pliku, każdy upload większy niż jeden chunk padłby na drugim chunku — a
+  `4xx` jest klasyfikowane jako błąd nieretryowalny. Zachowanie jest
+  przypięte testem `create=1 query parameter › is sent on EVERY chunk`.
 - **Nagłówki:**
   - `Range: bytes=<start>-<end-1>` — **tylko gdy plik jest dzielony na
     wiele chunków**. Dla single‑chunk (`size = -1` albo `size >= file.size`)
@@ -130,15 +135,113 @@ callbacka zatrzymuje upload i jest propagowany jako `Failed to upload file: …`
 
 ## ⚙️ Konfiguracja
 
-| Parametr                   | Typ                      | Opis                                                            |
-| -------------------------- | ------------------------ | --------------------------------------------------------------- |
-| `endpoints.upload`         | `string`                 | URL endpointu do wysyłki chunków, np. `/api/upload/{upload_id}` |
-| `endpoints.finish`         | `string`                 | URL do weryfikacji i zakończenia uploadu                        |
-| `headers`                  | `Record<string, string>` | Dodatkowe nagłówki (np. `Authorization`)                        |
-| `alg`                      | `string`                 | Algorytm haszujący, np. `sha-256` (domyślnie)                   |
-| `progressReportIntervalMs` | `number`                 | Minimalny odstęp czasu między raportami postępu (ms)            |
-| `progressReportBytes`      | `number`                 | Minimalna liczba bajtów między raportami postępu                |
-| `onFinalize`               | `() => Promise<void>`    | Opcjonalny callback po zakończeniu uploadu                      |
+| Parametr                   | Typ                      | Domyślnie | Opis                                                            |
+| -------------------------- | ------------------------ | --------- | --------------------------------------------------------------- |
+| `endpoints.upload`         | `string`                 | —         | URL endpointu do wysyłki chunków, np. `/api/upload/{upload_id}` |
+| `endpoints.finish`         | `string`                 | —         | URL do weryfikacji i zakończenia uploadu                        |
+| `headers`                  | `Record<string, string>` | —         | Dodatkowe nagłówki (np. `Authorization`)                        |
+| `alg`                      | `string`                 | `sha-256` | Algorytm haszujący                                              |
+| `progressReportIntervalMs` | `number`                 | `1000`    | Minimalny odstęp czasu między raportami postępu (ms)            |
+| `progressReportBytes`      | `number`                 | `1000000` | Minimalna liczba bajtów między raportami postępu                |
+| `hashStreamingThresholdBytes` | `number`              | `67108864` | Powyżej tego rozmiaru suma kontrolna liczona strumieniowo; `0` = zawsze WebCrypto |
+| `hashSliceBytes`           | `number`                 | `8388608` | Ile pliku jest w pamięci naraz przy hashowaniu strumieniowym     |
+| `maxChunkRetries`          | `number`                 | `10`      | Liczba prób na chunk (pierwsza próba się liczy; `1` = bez retry)|
+| `maxFinishRetries`         | `number`                 | `3`       | Liczba prób wywołania `finish`                                  |
+| `chunkRetryDelayMs`        | `number`                 | `10000`   | Odstęp między próbami (anulowalny przez `abort`)                |
+| `stallTimeoutMs`           | `number`                 | `60000`   | Budżet **bezruchu** przy wysyłce chunka; `0` wyłącza            |
+| `responseTimeoutMs`        | `number`                 | `300000`  | Budżet oczekiwania na odpowiedź serwera; `0` wyłącza            |
+| `onChunkRetry`             | `(info) => void`         | —         | Hook przed każdą ponowną próbą (`info.phase`: `chunk`/`finish`) |
+| `onFinalize`               | `(sha256) => Promise<void>` | —      | Callback po udanej weryfikacji `finish`                         |
+
+---
+
+## ⏱️ Timeouty
+
+XHR sam z siebie **czeka w nieskończoność**, więc zerwane („half-open")
+połączenie potrafiło zawiesić upload na zawsze: `onerror` nie leci, więc
+pętla retry jest nieosiągalna, a `await` nigdy się nie kończy. Klient pilnuje
+tego dwoma niezależnymi budżetami:
+
+- **`stallTimeoutMs` — budżet bezruchu.** Uzbrajany przed `send()` i
+  **przezbrajany przy każdym ruchu bajtów** (`upload.onprogress`). Jest więc
+  niezależny od przepustowości: chunk 25 MiB pełznący po łączu 1 Mbit/s
+  bez przerwy go resetuje i nigdy nie zostanie ubity — łapane jest wyłącznie
+  połączenie, na którym *nic* się nie dzieje.
+- **`responseTimeoutMs` — budżet odpowiedzi.** Uzbrajany, gdy ciało żądania
+  trafiło już do transportu (`upload.loadend`); od tego momentu nie ma
+  więcej zdarzeń postępu, które mogłyby świadczyć o życiu połączenia.
+  Domyślne 5 minut jest celowo hojne: `upload.onprogress` raportuje bajty
+  oddane do bufora gniazda, a nie potwierdzone przez serwer, więc mały chunk
+  potrafi pokazać 100% będąc wciąż w locie. Chodzi o ograniczenie połączenia,
+  które **nigdy** nie odpowie — nie o egzekwowanie SLO. Zaciskaj dopiero
+  mając telemetrię.
+
+Przekroczenie któregokolwiek budżetu jest raportowane jako `ChunkUploadError`
+z `kind: "timeout"` i `retryable: true` — czyli jako coś innego niż
+anulowanie przez użytkownika (`kind: "abort"`, `retryable: false`).
+
+---
+
+## 🔢 Suma kontrolna
+
+`crypto.subtle.digest` jest jednorazowe — potrzebuje całej wiadomości w
+pamięci naraz. Dla uploadu wielogigabajtowego oznacza to `file.arrayBuffer()`
+wielkości pliku, czyli OOM karty przeglądarki dokładnie na tych plikach,
+których użytkownik najmniej chce stracić (i mnożnik, gdy kiedyś ruszy
+równoległe wysyłanie kilku plików naraz).
+
+W WebCrypto nie ma strumieniowego digestu, więc klient ma dwie ścieżki:
+
+- **do `hashStreamingThresholdBytes`** — `crypto.subtle.digest` na całym
+  pliku. Stoi za tym BoringSSL i jest szybsze niż jakakolwiek implementacja
+  w JS, więc to domyślna droga;
+- **powyżej** — inkrementalny SHA-256 karmiony kawałkami po
+  `hashSliceBytes`, dzięki czemu rezydentny jest tylko jeden kawałek.
+
+**Obie ścieżki dają identyczny digest** — próg to kompromis
+pamięć/szybkość, nigdy poprawność. Pilnuje tego `sha256.test.ts`,
+porównując implementację inkrementalną z platformową na losowych wejściach,
+każdej granicy paddingu i każdym sposobie pocięcia wiadomości; a
+`UploaderClient.hashing.test.ts` sprawdza, że `upload_id` nie zależy od tego,
+która ścieżka się wykonała.
+
+Hashowanie wielogigabajtowego pliku trwa, więc pętla strumieniowa sprawdza
+`abort` między kawałkami — wcześniej anulowanie nie mogło się przebić, dopóki
+cały plik nie został wczytany.
+
+---
+
+## 🧯 Błędy
+
+Każda porażka to `ChunkUploadError` z maszynowo czytelnym `kind`, statusem
+HTTP i jawnym werdyktem `retryable`:
+
+```ts
+import { ChunkUploadError } from "@craftserve/ts-chunked-uploader";
+
+try {
+  await uploader.upload(file, 25 * 1024 * 1024);
+} catch (err) {
+  if (err instanceof ChunkUploadError) {
+    console.log(err.kind);      // "http" | "network" | "timeout" | "abort" | "unknown"
+    console.log(err.status);    // 507
+    console.log(err.retryable); // false
+    console.log(err.detail);    // treść błędu z daemona (przycięta)
+  }
+}
+```
+
+Reguła retry: `5xx` tak, `4xx` nie — z czterema świadomymi wyjątkami.
+**`507 Insufficient Storage`** i **`501 Not Implemented`** nie są ponawiane
+(pełny wolumen sam się nie opróżni; 507 ponawiane 10× co 10 s zamieniało
+natychmiastowe „brak miejsca" w 90-sekundową zwiechę zakończoną tym samym
+błędem). **`408`** i **`429`** są ponawiane, bo dokładnie o to proszą.
+
+`finish` (GET, idempotentny) jest ponawiany przy błędach przejściowych, ale
+**niezgodność sumy kontrolnej lub długości nie jest** — to twarde stwierdzenie
+o bajtach na dysku, nie czkawka. `onFinalize` **nie jest ponawiany**: wykonuje
+przeniesienie pliku, które nie jest idempotentne, a ponowienie po utraconej
+odpowiedzi zgłosiłoby fałszywą porażkę dla pliku, który wylądował poprawnie.
 
 ---
 

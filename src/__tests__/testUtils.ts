@@ -11,12 +11,19 @@ export class MockXHR {
   static instances: MockXHR[] = [];
   static autoComplete: ((xhr: MockXHR) => void) | null = null;
 
-  public upload: { onprogress: ((ev: any) => void) | null } = {
+  public upload: {
+    onprogress: ((ev: any) => void) | null;
+    onloadend: (() => void) | null;
+  } = {
     onprogress: null,
+    onloadend: null,
   };
   public onload: (() => void) | null = null;
   public onerror: (() => void) | null = null;
   public onabort: (() => void) | null = null;
+
+  /** Real XHR only fires `abort` while the request is in flight. */
+  private settled = false;
 
   public method = "";
   public url = "";
@@ -52,6 +59,8 @@ export class MockXHR {
   }
 
   abort() {
+    if (this.settled) return;
+    this.settled = true;
     if (this.onabort) this.onabort();
   }
 
@@ -62,17 +71,35 @@ export class MockXHR {
     }
   }
 
-  finishOK(status = 200) {
+  /**
+   * Fire `upload.loadend` — the request body has been handed to the
+   * transport and the client is now waiting on the server. This is the
+   * point where UploaderClient switches from its stall budget to its
+   * response budget.
+   */
+  finishUploadBody() {
+    if (this.upload.onloadend) this.upload.onloadend();
+  }
+
+  finishOK(status = 200, responseText = "") {
+    if (this.settled) return;
+    this.settled = true;
     this.status = status;
+    this.responseText = responseText;
     if (this.onload) this.onload();
   }
 
-  finishError(status: number) {
+  finishError(status: number, responseText = "") {
+    if (this.settled) return;
+    this.settled = true;
     this.status = status;
+    this.responseText = responseText;
     if (this.onload) this.onload();
   }
 
   networkError() {
+    if (this.settled) return;
+    this.settled = true;
     if (this.onerror) this.onerror();
   }
 
