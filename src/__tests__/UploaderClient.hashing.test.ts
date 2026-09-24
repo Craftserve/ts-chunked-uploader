@@ -16,10 +16,11 @@ import { UploaderClient } from "../UploaderClient";
 import {
   MockXHR,
   bytesToBase64,
+  expectUploadIdFor,
   installFetchStub,
   makeFile,
   tick,
-  toBase64Url,
+  uploadIdHashPart,
 } from "./testUtils";
 
 const UPLOAD_URL = "/api/uploads/{upload_id}/chunk";
@@ -74,7 +75,7 @@ describe("UploaderClient checksum", () => {
   });
 
   describe("threshold equivalence", () => {
-    it("produces the same upload_id whether it streams or not", async () => {
+    it("produces the same hash prefix whether it streams or not", async () => {
       const bytes = pseudoRandom(5000, 31);
       const expected = await realHashBase64(bytes);
 
@@ -100,8 +101,8 @@ describe("UploaderClient checksum", () => {
         ids.push(await runUpload(client, makeFile(bytes)));
       }
 
-      expect(ids[0]).toBe(toBase64Url(expected));
-      expect(ids[1]).toBe(ids[0]);
+      expectUploadIdFor(ids[0], expected);
+      expect(uploadIdHashPart(ids[1])).toBe(uploadIdHashPart(ids[0]));
     });
 
     it("streams correctly when the file is not a multiple of the slice size", async () => {
@@ -122,9 +123,8 @@ describe("UploaderClient checksum", () => {
         hashSliceBytes: 1024,
       });
 
-      await expect(runUpload(client, makeFile(bytes))).resolves.toBe(
-        toBase64Url(expected),
-      );
+      const streamedId = await runUpload(client, makeFile(bytes));
+      expectUploadIdFor(streamedId, expected);
     });
 
     it("hashes an empty file identically on both paths", async () => {
@@ -142,9 +142,8 @@ describe("UploaderClient checksum", () => {
         hashStreamingThresholdBytes: 1,
       });
 
-      await expect(runUpload(client, makeFile(bytes))).resolves.toBe(
-        toBase64Url(expected),
-      );
+      const emptyId = await runUpload(client, makeFile(bytes));
+      expectUploadIdFor(emptyId, expected);
     });
   });
 
@@ -176,9 +175,8 @@ describe("UploaderClient checksum", () => {
         hashSliceBytes: 512,
       });
 
-      await expect(runUpload(client, file)).resolves.toBe(
-        toBase64Url(expected),
-      );
+      const wholeFileId = await runUpload(client, file);
+      expectUploadIdFor(wholeFileId, expected);
       expect(wholeFileRead).not.toHaveBeenCalled();
     });
 
@@ -267,10 +265,41 @@ describe("UploaderClient checksum", () => {
       expect(err).toBeInstanceOf(ChunkUploadError);
       expect((err as ChunkUploadError).kind).toBe("abort");
       expect((err as ChunkUploadError).retryable).toBe(false);
+      expect((err as ChunkUploadError).uploadId).toBeUndefined();
       // Aborted partway, not after grinding through all 20 slices.
       expect(slicesRead).toBeLessThan(bytes.length);
       // And it never got as far as opening a request.
       expect(MockXHR.instances.length).toBe(0);
+    });
+
+    it("does not mint an id when abort lands during the whole-file digest", async () => {
+      const bytes = pseudoRandom(4, 59);
+      const file = makeFile(bytes);
+
+      const realDigest = crypto.subtle.digest.bind(crypto.subtle);
+      vi.spyOn(crypto.subtle, "digest").mockImplementation(async (algorithm, data) => {
+        await tick(40);
+        return realDigest(algorithm, data);
+      });
+
+      installFetchStub();
+      const client = new UploaderClient({
+        endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
+      });
+
+      const p = client.upload(file, -1);
+      await tick(5);
+      client.abort();
+
+      const err = await p.then(
+        () => null,
+        (e: unknown) => e,
+      );
+
+      expect(err).toBeInstanceOf(ChunkUploadError);
+      expect((err as ChunkUploadError).kind).toBe("abort");
+      expect(MockXHR.instances.length).toBe(0);
+      expect((err as ChunkUploadError).uploadId).toBeUndefined();
     });
   });
 });

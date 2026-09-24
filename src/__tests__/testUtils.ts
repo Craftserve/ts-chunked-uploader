@@ -1,4 +1,7 @@
-import { vi } from "vitest";
+import { expect, vi } from "vitest";
+import { toBase64Url } from "../helpers/base64url";
+
+export { toBase64Url };
 
 /**
  * MockXHR — drop-in replacement for XMLHttpRequest that lets tests drive
@@ -210,13 +213,15 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-/**
- * Convert a std-base64 string to base64url (RFC 4648 §5): '+'→'-', '/'→'_',
- * trailing '=' padding stripped. Matches the transform applied to upload_id
- * inside UploaderClient.upload().
- */
-export function toBase64Url(s: string): string {
-  return s.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+export const UPLOAD_ID_RE = /^[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{16}$/;
+
+export function expectUploadIdFor(id: string, stdB64Hash: string): void {
+  expect(id).toMatch(UPLOAD_ID_RE);
+  expect(id.split(".")[0]).toBe(toBase64Url(stdB64Hash));
+}
+
+export function uploadIdHashPart(id: string): string {
+  return id.split(".")[0];
 }
 
 /**

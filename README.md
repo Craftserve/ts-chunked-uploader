@@ -75,15 +75,19 @@ Biblioteka nie definiuje endpointów ani ich nie tworzy — jedynie wywołuje dw
 - **Metoda:** `PUT`
 - **URL:** wzorzec z `{upload_id}`, np. `/api/uploads/{upload_id}/chunk`.
   `{upload_id}` to **base64url** (RFC 4648 §5, bez padding `=`) ze skrótu
-  SHA‑256 całego pliku — to jest tylko identyfikator dla URL‑a, nie wartość
-  do porównywania (patrz `finish` poniżej).
-  Gdy `overwrite=false` klient dokleja query `?create=1` — **do każdego
-  chunka, nie tylko do pierwszego**. URL jest budowany raz, przed pętlą po
-  chunkach, więc backend musi traktować `create=1` idempotentnie
-  („utwórz, jeśli nie istnieje"). Gdyby wymuszał odrzucenie przy istniejącym
-  pliku, każdy upload większy niż jeden chunk padłby na drugim chunku — a
-  `4xx` jest klasyfikowane jako błąd nieretryowalny. Zachowanie jest
-  przypięte testem `create=1 query parameter › is sent on EVERY chunk`.
+  SHA‑256 całego pliku, doklejony `.` i 16 znaków losowego base64url —
+  ten sufiks daje każdemu wywołaniu `upload()` własną ścieżkę tymczasową,
+  nawet gdy dwa uploady niosą identyczną zawartość. Cały ten identyfikator
+  jest tylko wartością dla URL‑a, nie wartością do porównywania (patrz
+  `finish` poniżej).
+  Klient zawsze dokleja query `?create=1` — **do każdego chunka, nie tylko
+  do pierwszego**. Parametr `overwrite` jest ignorowany. URL
+  jest budowany raz, przed pętlą po chunkach, więc backend musi traktować
+  `create=1` idempotentnie („utwórz, jeśli nie istnieje"). Gdyby wymuszał
+  odrzucenie przy istniejącym pliku, każdy upload większy niż jeden chunk
+  padłby na drugim chunku — a `4xx` jest klasyfikowane jako błąd
+  nieretryowalny. Zachowanie jest przypięte testem `create=1 query
+  parameter › is sent on EVERY chunk`.
 - **Nagłówki:**
   - `Range: bytes=<start>-<end-1>` — **tylko gdy plik jest dzielony na
     wiele chunków**. Dla single‑chunk (`size = -1` albo `size >= file.size`)
@@ -120,7 +124,8 @@ Biblioteka nie definiuje endpointów ani ich nie tworzy — jedynie wywołuje dw
 > SHA‑256:
 >
 > - **base64url** w segmencie URL‑a `{upload_id}` — bezpieczne ścieżkowo,
->   bez `+`, `/`, `=`. Ta wartość jest zwracana przez `upload()`.
+>   bez `+`, `/`, `=`, z dołączonym losowym sufiksem. Ta wartość jest
+>   zwracana przez `upload()`.
 > - **standard base64** w polu `hash` z `finish` (kontrakt z daemonem) — wartość
 >   porównywana lokalnie; przekazywana do `onFinalize` (jeśli skonfigurowane).
 
@@ -202,8 +207,8 @@ W WebCrypto nie ma strumieniowego digestu, więc klient ma dwie ścieżki:
 pamięć/szybkość, nigdy poprawność. Pilnuje tego `sha256.test.ts`,
 porównując implementację inkrementalną z platformową na losowych wejściach,
 każdej granicy paddingu i każdym sposobie pocięcia wiadomości; a
-`UploaderClient.hashing.test.ts` sprawdza, że `upload_id` nie zależy od tego,
-która ścieżka się wykonała.
+`UploaderClient.hashing.test.ts` sprawdza, że część hashowa `upload_id` nie
+zależy od tego, która ścieżka się wykonała.
 
 Hashowanie wielogigabajtowego pliku trwa, więc pętla strumieniowa sprawdza
 `abort` między kawałkami — wcześniej anulowanie nie mogło się przebić, dopóki
@@ -227,9 +232,15 @@ try {
     console.log(err.status);    // 507
     console.log(err.retryable); // false
     console.log(err.detail);    // treść błędu z daemona (przycięta)
+    console.log(err.uploadId);  // identyfikator ścieżki tymczasowej albo undefined
   }
 }
 ```
+
+`uploadId` jest ustawiony na każdym błędzie zgłoszonym po wyliczeniu
+identyfikatora (błąd chunka, przerwanie, błąd `finish`) — pozwala powiązać
+błąd z konkretną ścieżką tymczasową do sprzątnięcia. Jest nieobecny, gdy
+błąd wystąpił podczas liczenia sumy kontrolnej, zanim identyfikator powstał.
 
 Reguła retry: `5xx` tak, `4xx` nie — z czterema świadomymi wyjątkami.
 **`507 Insufficient Storage`** i **`501 Not Implemented`** nie są ponawiane

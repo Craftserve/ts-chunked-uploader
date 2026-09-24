@@ -19,6 +19,7 @@ import { UploaderClient } from "../UploaderClient";
 import { ChunkRetryInfo } from "../types";
 import {
   MockXHR,
+  UPLOAD_ID_RE,
   expectedHashForFile,
   installCryptoStub,
   installFetchStub,
@@ -109,6 +110,7 @@ describe("UploaderClient resilience", () => {
       expect(typed.retryable).toBe(false);
       // The daemon's own message is preserved for diagnostics.
       expect(typed.detail).toContain("forbidden");
+      expect(typed.uploadId).toMatch(UPLOAD_ID_RE);
     });
 
     it("does NOT retry 507 — a full volume will not empty itself", async () => {
@@ -166,6 +168,134 @@ describe("UploaderClient resilience", () => {
       await expect(p).rejects.toThrow(/status 501/);
       await tick(20);
       expect(MockXHR.instances.length).toBe(1);
+    });
+  });
+
+  describe("uploadId on every post-id failure", () => {
+    const idFromUrl = (u: string) => new URL(u, "http://x").pathname.split("/")[3];
+
+    it("chunk 403: the id on the error matches the id in the chunk URL", async () => {
+      installFetchStub();
+      const { file } = tinyFile(20);
+
+      const client = new UploaderClient({
+        endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
+      });
+      const p = client.upload(file, -1);
+      await MockXHR.waitForCount(1);
+      MockXHR.last().finishError(403, "forbidden");
+
+      const err = await p.then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ChunkUploadError);
+      const typed = err as ChunkUploadError;
+      expect(typed.uploadId).toBe(idFromUrl(MockXHR.last().url));
+      expect(typed.kind).toBe("http");
+      expect(typed.status).toBe(403);
+      expect(typed.name).toBe("ChunkUploadError");
+    });
+
+    it("abort between chunks carries the id from the chunk URL", async () => {
+      const bytes = new Uint8Array(8).fill(21);
+      const fetchStub = installFetchStub();
+      fetchStub.queue.push({
+        status: 200,
+        body: { hash: expectedHashForFile(8, 21), length: 8 },
+      });
+      const client = new UploaderClient({
+        endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
+      });
+      const p = client.upload(makeFile(bytes), 4);
+      await MockXHR.waitForCount(1);
+      MockXHR.last().finishOK(200);
+      client.abort();
+
+      const err = await p.then(
+        () => null,
+        (e: unknown) => e,
+      );
+      const typed = err as ChunkUploadError;
+      expect(typed.message).toMatch(/Upload aborted/);
+      expect(MockXHR.instances.length).toBe(1);
+      expect(typed.uploadId).toBe(idFromUrl(MockXHR.instances[0].url));
+    });
+
+    it("finish malformed body carries the id", async () => {
+      const fetchStub = installFetchStub();
+      fetchStub.queue.push({ status: 200, body: { length: 4 } });
+      const client = new UploaderClient({
+        endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
+        maxFinishRetries: 1,
+      });
+      const p = client.upload(makeFile(new Uint8Array(4).fill(22)), -1);
+      await MockXHR.waitForCount(1);
+      MockXHR.last().finishOK(200);
+
+      const err = await p.then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ChunkUploadError);
+      expect((err as ChunkUploadError).uploadId).toBe(idFromUrl(MockXHR.last().url));
+    });
+
+    it("onFinalize throwing wraps the error, keeps the cause, and carries the id", async () => {
+      const fetchStub = installFetchStub();
+      fetchStub.queue.push({
+        status: 200,
+        body: { hash: expectedHashForFile(4, 23), length: 4 },
+      });
+      const boom = new Error("move failed");
+      const client = new UploaderClient({
+        endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
+        onFinalize: async () => {
+          throw boom;
+        },
+      });
+      const p = client.upload(makeFile(new Uint8Array(4).fill(23)), -1);
+      await MockXHR.waitForCount(1);
+      MockXHR.last().finishOK(200);
+
+      const err = await p.then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ChunkUploadError);
+      const typed = err as ChunkUploadError;
+      expect(typed.kind).toBe("unknown");
+      expect(typed.cause).toBe(boom);
+      expect(typed.message).toBe("Failed to upload file: move failed");
+      expect(typed.uploadId).toBe(idFromUrl(MockXHR.last().url));
+    });
+
+    it("abort while finish is in flight carries the id", async () => {
+      installFetchStub();
+      // The shared stub ignores the signal. Real fetch rejects on abort.
+      (globalThis as any).fetch = (_u: string, init?: RequestInit) =>
+        new Promise((_res, rej) => {
+          init?.signal?.addEventListener("abort", () =>
+            rej(new DOMException("aborted", "AbortError")),
+          );
+        });
+      const client = new UploaderClient({
+        endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
+      });
+      const p = client.upload(makeFile(new Uint8Array(4).fill(24)), -1);
+      await MockXHR.waitForCount(1);
+      MockXHR.last().finishOK(200);
+      await tick(5);
+      client.abort();
+
+      const err = await p.then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ChunkUploadError);
+      const typed = err as ChunkUploadError;
+      expect(typed.kind).toBe("abort");
+      expect(typed.uploadId).toBe(idFromUrl(MockXHR.last().url));
     });
   });
 
@@ -308,6 +438,7 @@ describe("UploaderClient resilience", () => {
       const typed = err as ChunkUploadError;
       expect(typed.kind).toBe("abort");
       expect(typed.retryable).toBe(false);
+      expect(typed.uploadId).toMatch(UPLOAD_ID_RE);
 
       // No retry was attempted despite a budget of 5.
       await tick(20);
@@ -370,9 +501,14 @@ describe("UploaderClient resilience", () => {
         chunkRetryDelayMs: 1,
       });
 
-      await expect(uploadUntilFinish(client, file)).rejects.toThrow(
-        /Checksum mismatch/,
+      const err = await uploadUntilFinish(client, file).then(
+        () => null,
+        (e: unknown) => e,
       );
+      expect(err).toBeInstanceOf(ChunkUploadError);
+      const typed = err as ChunkUploadError;
+      expect(typed.message).toMatch(/Checksum mismatch/);
+      expect(typed.uploadId).toMatch(UPLOAD_ID_RE);
       expect(fetchStub.calls.length).toBe(1);
     });
 
@@ -389,9 +525,14 @@ describe("UploaderClient resilience", () => {
         chunkRetryDelayMs: 1,
       });
 
-      await expect(uploadUntilFinish(client, file)).rejects.toThrow(
-        /HTTP 503/,
+      const err = await uploadUntilFinish(client, file).then(
+        () => null,
+        (e: unknown) => e,
       );
+      expect(err).toBeInstanceOf(ChunkUploadError);
+      const typed = err as ChunkUploadError;
+      expect(typed.message).toMatch(/HTTP 503/);
+      expect(typed.uploadId).toMatch(UPLOAD_ID_RE);
       expect(fetchStub.calls.length).toBe(3);
     });
 
@@ -451,7 +592,7 @@ describe("UploaderClient resilience", () => {
       expect(MockXHR.instances.length).toBe(3);
     });
 
-    it("is omitted entirely when overwrite is true", async () => {
+    it("is present even when overwrite is true", async () => {
       const fetchStub = installFetchStub();
       const { file, hash, size } = tinyFile(18);
       fetchStub.queue.push({ status: 200, body: { hash, length: size } });
@@ -462,7 +603,7 @@ describe("UploaderClient resilience", () => {
       const p = client.upload(file, -1, true);
 
       await MockXHR.waitForCount(1);
-      expect(MockXHR.last().url).not.toContain("create=1");
+      expect(MockXHR.last().url).toContain("create=1");
       MockXHR.last().finishOK(200);
 
       await expect(p).resolves.toBeTruthy();

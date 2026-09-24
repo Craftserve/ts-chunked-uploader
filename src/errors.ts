@@ -33,6 +33,8 @@ export interface ChunkUploadErrorOptions {
   /** Truncated response body, kept for diagnostics. */
   detail?: string;
   cause?: unknown;
+  /** The staging id the failing attempt was using, if one had been assigned. */
+  uploadId?: string;
 }
 
 /**
@@ -48,6 +50,8 @@ export class ChunkUploadError extends Error {
   readonly status?: number;
   readonly detail?: string;
   readonly cause?: unknown;
+  /** Set by upload() on every error thrown after the id exists. */
+  uploadId?: string;
 
   constructor(message: string, options: ChunkUploadErrorOptions) {
     super(message);
@@ -57,6 +61,7 @@ export class ChunkUploadError extends Error {
     this.status = options.status;
     this.detail = options.detail;
     this.cause = options.cause;
+    this.uploadId = options.uploadId;
 
     // `extends Error` loses the prototype link when the consumer compiles
     // this package down to ES5. The package targets ES2015 so this is
