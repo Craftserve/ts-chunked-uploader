@@ -4,6 +4,7 @@ import {
   isRetryableStatus,
   truncateDetail,
 } from "./errors";
+import { toBase64Url } from "./helpers/base64url";
 import { formatHashFromApi } from "./helpers/formatHash";
 import { Sha256 } from "./helpers/sha256";
 import {
@@ -837,10 +838,12 @@ export class UploaderClient {
    * Upload a file in chunks.
    * @param file The file to upload.
    * @param size The size of each chunk. -1 means upload in a single chunk.
-   * @param overwrite Whether to overwrite existing data. Default is false (append).
-   * @returns The base64url upload ID (same as used in the upload URL path).
+   * @param _overwrite Ignored. Every call uploads to a fresh staging path, so
+   * the client always sends ?create=1. Kept for signature compatibility.
+   * @returns The staging upload ID used in the upload URL path: base64url(sha256)
+   * followed by `.` and a 16-character random suffix, unique per call.
    */
-  async upload(file: File, size: number, overwrite = false): Promise<string> {
+  async upload(file: File, size: number, _overwrite = false): Promise<string> {
     this.aborted = false;
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
@@ -852,7 +855,6 @@ export class UploaderClient {
     const alg = this.config.alg || DEFAULT_HASH_ALG;
 
     const total = file.size;
-    let uploaded = 0;
 
     this.reportProgress(
       {
@@ -868,28 +870,39 @@ export class UploaderClient {
     try {
       sha256 = await this.computeHash(file, alg, signal);
     } catch (err) {
-      this.reportProgress({ uploaded, total, state: UploadState.Error }, true);
+      this.reportProgress(
+        { uploaded: 0, total, state: UploadState.Error },
+        true,
+      );
       throw err;
     }
 
-    // The upload_id is used as a URL path segment, so it must not contain
-    // characters from the standard base64 alphabet that are unsafe in URLs
-    // ('+', '/', '='). We derive a base64url variant (RFC 4648 §5) of the
-    // SHA-256 specifically for the path identifier.
+    // An abort during hashing gets no id: no staging file exists to clean up.
+    if (this.aborted || signal.aborted) {
+      this.reportProgress(
+        { uploaded: 0, total, state: UploadState.Error },
+        true,
+      );
+      throw new ChunkUploadError("Upload aborted", {
+        kind: "abort",
+        retryable: false,
+      });
+    }
+
+    // The upload_id is a URL path segment, so its hash part is base64url.
+    // The random suffix gives each call its own staging path, even for
+    // identical content.
     //
     // The compare value (`sha256`) stays in std-base64 because that's what
     // the daemon emits in the `finish` response — see WEB-1549.
-    const uploadId = sha256
-      .replace(/\+/g, "-")
-      .replace(/\//g, "_")
-      .replace(/=+$/, "");
+    const nonce = new Uint8Array(12);
+    crypto.getRandomValues(nonce);
+    const uploadId = `${toBase64Url(sha256)}.${toBase64Url(bytesToBase64(nonce))}`;
     upload = upload.replace("{upload_id}", uploadId);
 
-    if (overwrite === false) {
-      const url = new URL(upload, window.location.origin);
-      url.searchParams.set("create", "1");
-      upload = url.toString();
-    }
+    const url = new URL(upload, window.location.origin);
+    url.searchParams.set("create", "1");
+    upload = url.toString();
 
     finish = finish.replace("{upload_id}", uploadId);
 
@@ -901,6 +914,34 @@ export class UploaderClient {
       },
       true,
     );
+
+    try {
+      return await this.runChunksAndFinish(
+        file,
+        chunkSize,
+        upload,
+        finish,
+        sha256,
+        uploadId,
+      );
+    } catch (err) {
+      if (err instanceof ChunkUploadError) err.uploadId = uploadId;
+      throw err;
+    }
+  }
+
+  private async runChunksAndFinish(
+    file: File,
+    chunkSize: number,
+    upload: string,
+    finish: string,
+    sha256: string,
+    uploadId: string,
+  ): Promise<string> {
+    const total = file.size;
+    let uploaded = 0;
+    const signal = this.abortController.signal;
+    const alg = this.config.alg || DEFAULT_HASH_ALG;
 
     const chunks = file.size === 0 ? 1 : Math.ceil(file.size / chunkSize);
 

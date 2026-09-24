@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { UploaderClient } from "../UploaderClient";
 import { ProgressState, UploadState } from "../types";
+import { ChunkUploadError } from "../errors";
 import {
   MockXHR,
+  expectUploadIdFor,
   expectedHashForFile,
   installCryptoStub,
   installFetchStub,
@@ -13,6 +15,7 @@ import {
 
 const UPLOAD_URL = "/api/uploads/{upload_id}/chunk";
 const FINISH_URL = "/api/uploads/{upload_id}/finish";
+
 
 function defaultFinishResponse(length: number, hash: string) {
   return { status: 200, body: { hash, length } };
@@ -41,7 +44,6 @@ describe("UploaderClient", () => {
       const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
       const file = makeFile(bytes);
       const expectedHash = expectedHashForFile(bytes.length, bytes[0]);
-      const expectedUploadId = toBase64Url(expectedHash);
       fetchStub.queue.push(defaultFinishResponse(bytes.length, expectedHash));
 
       const onFinalize = vi.fn(async () => {});
@@ -69,11 +71,12 @@ describe("UploaderClient", () => {
       xhr.finishOK(200);
 
       const result = await promise;
-      expect(result).toBe(expectedUploadId);
+      expectUploadIdFor(result, expectedHash);
+      expect(xhr.url).toContain(result);
 
       // finish was called, onFinalize was awaited.
       expect(fetchStub.calls.length).toBe(1);
-      expect(fetchStub.calls[0].url).toContain(toBase64Url(expectedHash));
+      expect(fetchStub.calls[0].url).toContain(result);
       // onFinalize gets the std-base64 hash (not the base64url path id).
       expect(onFinalize).toHaveBeenCalledWith(expectedHash);
 
@@ -85,6 +88,32 @@ describe("UploaderClient", () => {
       expect(states[states.length - 1].state).toBe(UploadState.Done);
       expect(states[states.length - 1].uploaded).toBe(bytes.length);
       expect(states[states.length - 1].total).toBe(bytes.length);
+    });
+
+    it("gives two uploads of identical content different staging ids (WEB-1838)", async () => {
+      const fetchStub = installFetchStub();
+      const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      const expectedHash = expectedHashForFile(bytes.length, bytes[0]);
+      fetchStub.queue.push(defaultFinishResponse(bytes.length, expectedHash));
+      fetchStub.queue.push(defaultFinishResponse(bytes.length, expectedHash));
+
+      const client = new UploaderClient({
+        endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
+      });
+
+      const p1 = client.upload(makeFile(bytes), -1);
+      await MockXHR.waitForCount(1);
+      MockXHR.last().finishOK(200);
+      const id1 = await p1;
+
+      const p2 = client.upload(makeFile(bytes), -1);
+      await MockXHR.waitForCount(2);
+      MockXHR.last().finishOK(200);
+      const id2 = await p2;
+
+      expectUploadIdFor(id1, expectedHash);
+      expectUploadIdFor(id2, expectedHash);
+      expect(id1).not.toBe(id2);
     });
 
     it("appends ?create=1 when overwrite is false (default)", async () => {
@@ -104,7 +133,7 @@ describe("UploaderClient", () => {
       await p;
     });
 
-    it("does NOT append create=1 when overwrite is true", async () => {
+    it("appends create=1 even when overwrite is true", async () => {
       const fetchStub = installFetchStub();
       const bytes = new Uint8Array([9]);
       const file = makeFile(bytes);
@@ -116,7 +145,7 @@ describe("UploaderClient", () => {
       });
       const p = client.upload(file, -1, true);
       await MockXHR.waitForCount(1);
-      expect(MockXHR.last().url).not.toMatch(/create=1/);
+      expect(MockXHR.last().url).toMatch(/[?&]create=1\b/);
       MockXHR.last().finishOK(200);
       await p;
     });
@@ -252,8 +281,7 @@ describe("UploaderClient", () => {
       expect(xhr.requestHeaders["Range"]).toBeUndefined();
       xhr.finishOK(200);
 
-      const result = await p;
-      expect(result).toBe(toBase64Url(h));
+      expectUploadIdFor(await p, h);
       expect(states[states.length - 1].state).toBe(UploadState.Done);
       expect(states[states.length - 1].uploaded).toBe(0);
       expect(states[states.length - 1].total).toBe(0);
@@ -272,7 +300,7 @@ describe("UploaderClient", () => {
       const p = client.upload(file, -1);
       await MockXHR.waitForCount(1);
       MockXHR.last().finishOK(200);
-      await expect(p).resolves.toBe(toBase64Url(h));
+      expectUploadIdFor(await p, h);
     });
 
     it("still rejects when the finish endpoint omits the length field", async () => {
@@ -366,7 +394,7 @@ describe("UploaderClient", () => {
       expect(info.error).toBeInstanceOf(Error);
 
       MockXHR.last().finishOK(200);
-      await expect(p).resolves.toBe(toBase64Url(h));
+      expectUploadIdFor(await p, h);
     });
 
     it("retries on 5xx", async () => {
@@ -386,7 +414,7 @@ describe("UploaderClient", () => {
       MockXHR.last().finishError(502);
       await MockXHR.waitForCount(2, 1000);
       MockXHR.last().finishOK(200);
-      await expect(p).resolves.toBe(toBase64Url(h));
+      expectUploadIdFor(await p, h);
     });
 
     it("does NOT retry on 4xx (non-retryable)", async () => {
@@ -602,7 +630,7 @@ describe("UploaderClient", () => {
       const p = client.upload(file, -1);
       await MockXHR.waitForCount(1);
       MockXHR.last().finishOK(200);
-      await expect(p).resolves.toBe(toBase64Url(h));
+      expectUploadIdFor(await p, h);
     });
 
     // 4xx on `finish` is permanent, so this also pins "no retry": the stub
@@ -767,8 +795,7 @@ describe("UploaderClient", () => {
       expect(new URL(xhrUrl).pathname).not.toMatch(/[+=]|%2B|%2F|%3D/i);
 
       MockXHR.last().finishOK(200);
-      // upload() resolves to the base64url upload_id.
-      await expect(p).resolves.toBe(base64url);
+      expectUploadIdFor(await p, stdBase64);
 
       // Same guarantee on the finish endpoint URL.
       const finishUrl = fetchStub.calls[0].url;
@@ -851,8 +878,13 @@ describe("UploaderClient", () => {
     const client = new UploaderClient({
       endpoints: { upload: UPLOAD_URL, finish: FINISH_URL },
     });
-    await expect(client.upload(file, -1)).rejects.toThrow(
-      /Failed to calculate checksum/,
+    const err = await client.upload(file, -1).then(
+      () => null,
+      (e: unknown) => e,
     );
+    expect(err).toBeInstanceOf(ChunkUploadError);
+    const typed = err as ChunkUploadError;
+    expect(typed.message).toMatch(/Failed to calculate checksum/);
+    expect(typed.uploadId).toBeUndefined();
   });
 });
